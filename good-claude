@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""good-claude: a plain read-eval-print loop over the Claude Agent SDK.
+
+The interactive Claude Code TUI owns the screen and hard-wraps every line to
+the terminal width. This client never draws a UI: the model's text goes to
+stdout a whole message segment at a time, not character by character, so the
+terminal does all wrapping and scrolling and the output can be selected and
+pasted unchanged. That makes it usable with a screen reader, and it makes
+copied output paste cleanly somewhere else.
+
+Everything that is not model text -- the banner, tool announcements, approval
+prompts, errors -- goes to stderr, so `good-claude > transcript.txt` captures
+only what the model said.
+
+Input:
+    Every prompt is multi-line. Enter only ever starts a new line, so nothing
+    is sent by accident and pasted text arrives as a single prompt. Ctrl-D on
+    an empty line sends what you have typed so far; Ctrl-D with nothing typed
+    does nothing. Quitting takes an explicit `/quit` on a line of its own.
+    Ctrl-C interrupts the turn in progress.
+
+Tool approval:
+    Every tool call is presented for approval: allow once, allow that tool for
+    the rest of the session, or deny with an optional reason that is passed
+    back to the model. This is enforced with a PreToolUse hook rather than the
+    SDK's can_use_tool callback, because can_use_tool only fires when the CLI's
+    permission rules already evaluate to "ask" -- anything covered by an allow
+    rule in settings would otherwise run unannounced.
+
+Sessions:
+    The session id is appended to ~/.good-claude/session-history.txt, so a
+    session is still recoverable if the terminal or the machine dies.
+    Resume one with `good-claude --resume <id>`.
+
+Environment:
+    GOOD_CLAUDE_MODEL     model alias or id (default: your configured model)
+    GOOD_CLAUDE_THINKING  set to 1 to show thinking text as well
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import readline  # noqa: F401  (gives input() editing and history)
+import sys
+import time
+from typing import Any
+
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    HookMatcher,
+    ResultMessage,
+    SystemMessage,
+    TextBlock,
+    ThinkingBlock,
+    ToolResultBlock,
+    UserMessage,
+)
+
+QUIT_COMMANDS = ("/quit", "/exit")
+SHOW_THINKING = os.environ.get("GOOD_CLAUDE_THINKING") == "1"
+# Generous: the hook is waiting on a human, not on a computation.
+APPROVAL_TIMEOUT_SECONDS = 3600.0
+HISTORY_PATH = os.path.expanduser("~/.good-claude/session-history.txt")
+
+# Tools the user has approved for the rest of this session.
+session_allowed: set[str] = set()
+# Serializes approval prompts, since parallel tool calls fire hooks concurrently.
+approval_lock = asyncio.Lock()
+# Set when a turn produces text, so an empty turn can fall back to the result.
+turn_had_text = False
+# Last character written to stdout, so turns are separated by exactly one blank line.
+last_char = "\n"
+
+
+def log_session(session_id: str) -> None:
+    """Append a session id to the history file."""
+    os.makedirs(os.path.dirname(HISTORY_PATH), exist_ok=True)
+    with open(HISTORY_PATH, "a", encoding="utf-8") as handle:
+        handle.write(session_id + "\n")
+
+
+def meta(text: str) -> None:
+    """Write a non-model line to stderr."""
+    sys.stderr.write(text + "\n")
+    sys.stderr.flush()
+
+
+def emit(text: str) -> None:
+    """Write model text to stdout with no added newlines."""
+    global turn_had_text, last_char
+    if text:
+        turn_had_text = True
+        last_char = text[-1]
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+
+def emit_block(text: str) -> None:
+    """Write one finished message segment, ending it on its own line."""
+    if not text:
+        return
+    emit(text)
+    if last_char != "\n":
+        emit("\n")
+
+
+def ask(prompt: str) -> str | None:
+    """Prompt on stderr and read a line. None means the input ended (Ctrl-D)."""
+    sys.stderr.write(prompt)
+    sys.stderr.flush()
+    try:
+        return input()
+    except EOFError:
+        return None
+
+
+def read_prompt() -> str | None:
+    """Read one multi-line prompt. Enter adds a line, Ctrl-D sends.
+
+    Returns None only when there is no more input to read at all, which for an
+    interactive terminal never happens: Ctrl-D on an empty buffer is ignored so
+    the session cannot be quit by accident.
+    """
+    tty = sys.stdout.isatty()
+    lines: list[str] = []
+    while True:
+        try:
+            line = input("> " if (tty and not lines) else "")
+            command = line.strip().lower()
+            # A typed alternative to Ctrl-D, which also makes the client
+            # scriptable: piped input has no way to send an EOF mid-stream.
+            if command == "/send":
+                break
+            if command in QUIT_COMMANDS:
+                # Never discard typed text on a stray /quit.
+                if lines:
+                    meta("Unsent text above. Send it, or /discard it, then /quit.")
+                    continue
+                return None
+            if command == "/discard":
+                lines.clear()
+                meta("(discarded)")
+                continue
+            lines.append(line)
+        except EOFError:
+            meta("")
+            if lines:
+                break
+            if not sys.stdin.isatty():
+                return None
+            meta("Nothing to send. Type /quit on its own line to exit.")
+            continue
+
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)
+
+
+def summarize(tool: str, data: dict[str, Any]) -> str:
+    """One readable line describing what a tool call is about to do."""
+    if tool == "Bash" and "command" in data:
+        return str(data["command"])
+    for key in ("file_path", "path", "notebook_path", "url", "pattern", "query"):
+        if key in data:
+            return str(data[key])
+    return json.dumps(data)[:400]
+
+
+def decision(kind: str, reason: str) -> dict[str, Any]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": kind,
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
+async def pre_tool_use(
+    input_data: dict[str, Any],
+    tool_use_id: str | None,
+    context: Any,
+) -> dict[str, Any]:
+    """Ask the user about every tool call before it runs."""
+    tool = input_data.get("tool_name", "?")
+    data = input_data.get("tool_input") or {}
+
+    async with approval_lock:
+        if tool in session_allowed:
+            meta("[%s: %s]" % (tool, summarize(tool, data)))
+            return decision("allow", "Allowed for this session by the user.")
+
+        meta("")
+        meta("Tool request: %s" % tool)
+        meta("  %s" % summarize(tool, data))
+        while True:
+            answer = await asyncio.to_thread(
+                ask, "allow? [y] once  [a] always this tool  [n] no  [v] view input: "
+            )
+            if answer is None:
+                meta("")
+                return decision("deny", "The user ended input without approving.")
+            answer = answer.strip().lower()
+            if answer in ("y", "yes"):
+                return decision("allow", "Approved by the user.")
+            if answer in ("a", "always"):
+                session_allowed.add(tool)
+                return decision("allow", "Approved by the user for this session.")
+            if answer in ("n", "no"):
+                reason = await asyncio.to_thread(ask, "reason (optional): ")
+                reason = (reason or "").strip()
+                return decision("deny", reason or "The user denied this tool call.")
+            if answer in ("v", "view"):
+                meta(json.dumps(data, indent=2))
+            else:
+                meta("Answer y, a, n, or v.")
+
+
+def result_text(content: str | list[dict[str, Any]] | None) -> str:
+    """Flatten a tool result into text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    parts = []
+    for block in content:
+        parts.append(block.get("text", "") if block.get("type") == "text" else json.dumps(block))
+    return "\n".join(parts)
+
+
+async def run_turn(client: ClaudeSDKClient, prompt: str) -> str | None:
+    """Send one prompt and print the response. Returns the session id."""
+    global turn_had_text
+    turn_had_text = False
+    session_id = None
+
+    await client.query(prompt)
+    meta("Waiting for response...")
+    async for message in client.receive_response():
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    emit_block(block.text)
+                elif isinstance(block, ThinkingBlock) and SHOW_THINKING:
+                    emit_block(block.thinking)
+        elif isinstance(message, UserMessage):
+            if isinstance(message.content, list):
+                for block in message.content:
+                    if isinstance(block, ToolResultBlock):
+                        label = "tool error" if block.is_error else "tool result"
+                        meta("[%s]" % label)
+                        meta(result_text(block.content))
+        elif isinstance(message, SystemMessage):
+            session_id = message.data.get("session_id") or session_id
+        elif isinstance(message, ResultMessage):
+            session_id = message.session_id or session_id
+            if not turn_had_text and message.result:
+                emit(message.result)
+            if message.is_error:
+                meta("[error: %s]" % (message.result or message.subtype))
+
+    sys.stdout.write("\n" if last_char == "\n" else "\n\n")
+    sys.stdout.flush()
+    return session_id
+
+
+async def main(resume: str | None) -> int:
+    options = ClaudeAgentOptions(
+        cwd=os.getcwd(),
+        model=os.environ.get("GOOD_CLAUDE_MODEL") or None,
+        resume=resume,
+        permission_mode="default",
+        setting_sources=["user", "project", "local"],
+        hooks={
+            "PreToolUse": [
+                HookMatcher(
+                    matcher=None,
+                    hooks=[pre_tool_use],
+                    timeout=APPROVAL_TIMEOUT_SECONDS,
+                )
+            ]
+        },
+    )
+
+    client = ClaudeSDKClient(options=options)
+    await client.connect()
+    meta("good-claude: connected in %s" % os.getcwd())
+    meta("good-claude: Enter starts a new line; Ctrl-D on an empty line sends.")
+    meta("good-claude: /send also sends, /discard drops what you have typed.")
+    meta("good-claude: /quit to exit, Ctrl-C to interrupt a turn.")
+    meta("")
+
+    session_id = None
+    try:
+        while True:
+            try:
+                prompt = await asyncio.to_thread(read_prompt)
+            except KeyboardInterrupt:
+                meta("")
+                continue
+            if prompt is None:
+                break
+            if not prompt.strip():
+                continue
+
+            try:
+                new_id = await run_turn(client, prompt)
+                if new_id and not session_id:
+                    log_session(new_id)
+                session_id = new_id or session_id
+            except KeyboardInterrupt:
+                await client.interrupt()
+                meta("")
+                meta("(interrupted)")
+    finally:
+        await client.disconnect()
+        if session_id:
+            meta("good-claude: resume this conversation with: good-claude --resume %s" % session_id)
+    return 0
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(prog="good-claude")
+    parser.add_argument(
+        "-r",
+        "--resume",
+        metavar="SESSION_ID",
+        help="resume an earlier session; ids are logged to %s" % HISTORY_PATH,
+    )
+    try:
+        sys.exit(asyncio.run(main(parser.parse_args().resume)))
+    except KeyboardInterrupt:
+        sys.exit(130)
