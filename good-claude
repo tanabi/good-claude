@@ -22,10 +22,12 @@ Input:
 Tool approval:
     Every tool call is presented for approval: allow once, allow that tool for
     the rest of the session, or deny with an optional reason that is passed
-    back to the model. This is enforced with a PreToolUse hook rather than the
-    SDK's can_use_tool callback, because can_use_tool only fires when the CLI's
-    permission rules already evaluate to "ask" -- anything covered by an allow
-    rule in settings would otherwise run unannounced.
+    back to the model. A prompt owns the terminal while it waits, so a tool
+    result arriving mid-prompt is held until you have answered rather than
+    printed on top of the question. This is enforced with a PreToolUse hook
+    rather than the SDK's can_use_tool callback, because it only fires when the
+    CLI's permission rules already evaluate to "ask" -- anything covered by an
+    allow rule in settings would otherwise run unannounced.
 
 Sessions:
     The session id is appended to ~/.good-claude/session-history.txt, so a
@@ -69,8 +71,12 @@ HISTORY_PATH = os.path.expanduser("~/.good-claude/session-history.txt")
 
 # Tools the user has approved for the rest of this session.
 session_allowed: set[str] = set()
-# Serializes approval prompts, since parallel tool calls fire hooks concurrently.
-approval_lock = asyncio.Lock()
+# Held by whoever is writing to the terminal: an approval prompt while it waits
+# for an answer, or the turn loop while it prints. One tool's result arrives
+# while the next tool's prompt is up, so without this they land on top of each
+# other. It also serializes the prompts themselves, since parallel tool calls
+# fire hooks concurrently.
+screen_lock = asyncio.Lock()
 # Set when a turn produces text, so an empty turn can fall back to the result.
 turn_had_text = False
 # Last character written to stdout, so turns are separated by exactly one blank line.
@@ -190,7 +196,7 @@ async def pre_tool_use(
     tool = input_data.get("tool_name", "?")
     data = input_data.get("tool_input") or {}
 
-    async with approval_lock:
+    async with screen_lock:
         if tool in session_allowed:
             meta("[%s: %s]" % (tool, summarize(tool, data)))
             return decision("allow", "Allowed for this session by the user.")
@@ -242,27 +248,29 @@ async def run_turn(client: ClaudeSDKClient, prompt: str) -> str | None:
     await client.query(prompt)
     meta("Waiting for response...")
     async for message in client.receive_response():
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    emit_block(block.text)
-                elif isinstance(block, ThinkingBlock) and SHOW_THINKING:
-                    emit_block(block.thinking)
-        elif isinstance(message, UserMessage):
-            if isinstance(message.content, list):
+        # Wait out any approval prompt rather than printing over it.
+        async with screen_lock:
+            if isinstance(message, AssistantMessage):
                 for block in message.content:
-                    if isinstance(block, ToolResultBlock):
-                        label = "tool error" if block.is_error else "tool result"
-                        meta("[%s]" % label)
-                        meta(result_text(block.content))
-        elif isinstance(message, SystemMessage):
-            session_id = message.data.get("session_id") or session_id
-        elif isinstance(message, ResultMessage):
-            session_id = message.session_id or session_id
-            if not turn_had_text and message.result:
-                emit(message.result)
-            if message.is_error:
-                meta("[error: %s]" % (message.result or message.subtype))
+                    if isinstance(block, TextBlock):
+                        emit_block(block.text)
+                    elif isinstance(block, ThinkingBlock) and SHOW_THINKING:
+                        emit_block(block.thinking)
+            elif isinstance(message, UserMessage):
+                if isinstance(message.content, list):
+                    for block in message.content:
+                        if isinstance(block, ToolResultBlock):
+                            label = "tool error" if block.is_error else "tool result"
+                            meta("[%s]" % label)
+                            meta(result_text(block.content))
+            elif isinstance(message, SystemMessage):
+                session_id = message.data.get("session_id") or session_id
+            elif isinstance(message, ResultMessage):
+                session_id = message.session_id or session_id
+                if not turn_had_text and message.result:
+                    emit(message.result)
+                if message.is_error:
+                    meta("[error: %s]" % (message.result or message.subtype))
 
     sys.stdout.write("\n" if last_char == "\n" else "\n\n")
     sys.stdout.flush()

@@ -73,7 +73,7 @@ allow? [y] once  [a] always this tool  [n] no  [v] view input:
 
 Once a tool runs, its output is printed under a `[tool result]` header, or `[tool error]` when the call failed. Both go to stderr along with everything else that is not model text. Results are printed in full and are not truncated, so reading a large file prints the whole file.
 
-This is enforced with a `PreToolUse` hook rather than the SDK's `can_use_tool` callback. That distinction matters: `can_use_tool` only fires when the CLI's permission rules already evaluate to "ask", so any tool covered by an allow rule in your settings would run without ever being announced. The hook sees every call regardless of permission rules. Approval prompts are serialized, so parallel tool calls queue up rather than fighting over your terminal.
+This is enforced with a `PreToolUse` hook rather than the SDK's `can_use_tool` callback. That distinction matters: `can_use_tool` only fires when the CLI's permission rules already evaluate to "ask", so any tool covered by an allow rule in your settings would run without ever being announced. The hook sees every call regardless of permission rules. Approval prompts are serialized, so parallel tool calls queue up rather than fighting over your terminal. A prompt also owns the terminal while it waits: anything the turn wants to print, including the previous tool's result, is held until you have answered, so nothing is dumped on top of the question you are being asked.
 
 ## Environment
 
