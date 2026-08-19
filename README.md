@@ -71,6 +71,22 @@ allow? [y] once  [a] always this tool  [n] no  [v] view input:
 
 `y` allows this one call, `a` allows that tool for the rest of the session, `n` denies it and then offers to attach a reason that is passed back to the model, and `v` prints the tool's full input as JSON when the one-line summary is not enough to decide.
 
+A call that would change a file shows the change itself, as a diff, so you are never asked "may I edit this file" without being told how:
+
+```
+Tool request: Edit
+  /tmp/notes/sample.txt
+   alpha
+  -beta
+  +BETA
+   gamma
+allow? [y] once  [a] always this tool  [n] no  [v] view input:
+```
+
+`Edit` diffs the text being replaced against its replacement, and says so when the edit replaces every occurrence rather than one. `Write` diffs the file on disk against the new contents, or prints the whole thing as an addition when the file does not exist yet. `NotebookEdit` prints the new cell source and says which cell it lands in and whether it is being inserted, replaced, or deleted. Tools that do not write files -- `Bash`, `Read`, `Grep` and the rest -- are unchanged; the one-line summary is all they get.
+
+The preview stops at 60 lines so that a large rewrite cannot scroll the question off the screen. When it is cut short it says how much was left out, and `v` still shows the entire input. A tool you have approved for the whole session with `a` prints its one-line announcement only, without the diff; the tool result that follows reports what changed.
+
 Once a tool runs, its output is printed under a `[tool result]` header, or `[tool error]` when the call failed. Both go to stderr along with everything else that is not model text. Results are printed in full and are not truncated, so reading a large file prints the whole file.
 
 This is enforced with a `PreToolUse` hook rather than the SDK's `can_use_tool` callback. That distinction matters: `can_use_tool` only fires when the CLI's permission rules already evaluate to "ask", so any tool covered by an allow rule in your settings would run without ever being announced. The hook sees every call regardless of permission rules. Approval prompts are serialized, so parallel tool calls queue up rather than fighting over your terminal. A prompt also owns the terminal while it waits: anything the turn wants to print, including the previous tool's result, is held until you have answered, so nothing is dumped on top of the question you are being asked.

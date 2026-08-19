@@ -22,7 +22,9 @@ Input:
 Tool approval:
     Every tool call is presented for approval: allow once, allow that tool for
     the rest of the session, or deny with an optional reason that is passed
-    back to the model. A prompt owns the terminal while it waits, so a tool
+    back to the model. A call that would change a file shows the change as a
+    diff first, so the question is never "may I edit this file" without an
+    answer to "edit it how". A prompt owns the terminal while it waits, so a tool
     result arriving mid-prompt is held until you have answered rather than
     printed on top of the question. This is enforced with a PreToolUse hook
     rather than the SDK's can_use_tool callback, because it only fires when the
@@ -43,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import difflib
 import json
 import os
 import readline  # noqa: F401  (gives input() editing and history)
@@ -68,6 +71,12 @@ SHOW_THINKING = os.environ.get("GOOD_CLAUDE_THINKING") == "1"
 # Generous: the hook is waiting on a human, not on a computation.
 APPROVAL_TIMEOUT_SECONDS = 3600.0
 HISTORY_PATH = os.path.expanduser("~/.good-claude/session-history.txt")
+# Diff lines shown before an approval prompt. A whole-file rewrite can be
+# thousands of lines, which would scroll the question off the screen; `v`
+# still shows the entire input.
+PREVIEW_LINES = 60
+# Lines of unchanged context around each change in a preview diff.
+PREVIEW_CONTEXT = 3
 
 # Tools the user has approved for the rest of this session.
 session_allowed: set[str] = set()
@@ -177,6 +186,88 @@ def summarize(tool: str, data: dict[str, Any]) -> str:
     return json.dumps(data)[:400]
 
 
+def diff_lines(before: str, after: str, hunks: bool) -> list[str]:
+    """Unified diff of two strings, without the ---/+++ file headers.
+
+    `hunks` keeps the @@ markers. They are worth showing when the line numbers
+    mean something, as in a whole-file rewrite, and misleading when the two
+    sides are snippets pulled out of the middle of a file, as in an Edit.
+    """
+    lines = difflib.unified_diff(
+        before.splitlines(),
+        after.splitlines(),
+        lineterm="",
+        n=PREVIEW_CONTEXT,
+    )
+    out = []
+    for line in lines:
+        if line.startswith("---") or line.startswith("+++"):
+            continue
+        if line.startswith("@@"):
+            if not hunks:
+                continue
+            if out:
+                out.append("")
+        out.append(line)
+    return out
+
+
+def read_file(path: str) -> str | None:
+    """Current contents of a file, or None if it cannot be read."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def preview(tool: str, data: dict[str, Any]) -> list[str]:
+    """The changes a tool call would make, as diff lines. Empty if it makes none.
+
+    Only tools that write are described here. Everything else is adequately
+    summarized by its one-line summary, and a diff of a Bash command or a Read
+    would be noise.
+    """
+    path = str(data.get("file_path") or data.get("notebook_path") or "")
+
+    if tool == "Edit":
+        lines = diff_lines(
+            str(data.get("old_string", "")), str(data.get("new_string", "")), hunks=False
+        )
+        if data.get("replace_all"):
+            lines.insert(0, "(replacing every occurrence)")
+        return lines
+
+    if tool == "Write":
+        before = read_file(path) if path else None
+        if before is None:
+            return ["(new file)"] + ["+" + line for line in str(data.get("content", "")).splitlines()]
+        return diff_lines(before, str(data.get("content", "")), hunks=True)
+
+    if tool == "NotebookEdit":
+        mode = str(data.get("edit_mode") or "replace")
+        source = str(data.get("new_source", ""))
+        cell = str(data.get("cell_id", "?"))
+        if mode == "delete":
+            return ["(deleting cell %s)" % cell]
+        head = "(%s cell %s)" % ("inserting" if mode == "insert" else "replacing", cell)
+        return [head] + ["+" + line for line in source.splitlines()]
+
+    return []
+
+
+def show_preview(tool: str, data: dict[str, Any]) -> None:
+    """Print what a tool call would change, capped so the prompt stays visible."""
+    lines = preview(tool, data)
+    if not lines:
+        return
+    for line in lines[:PREVIEW_LINES]:
+        meta("  %s" % line if line else "")
+    extra = len(lines) - PREVIEW_LINES
+    if extra > 0:
+        meta("  ... %d more line%s; v shows the whole input" % (extra, "" if extra == 1 else "s"))
+
+
 def decision(kind: str, reason: str) -> dict[str, Any]:
     return {
         "hookSpecificOutput": {
@@ -204,6 +295,8 @@ async def pre_tool_use(
         meta("")
         meta("Tool request: %s" % tool)
         meta("  %s" % summarize(tool, data))
+        # Reads the file being written, so keep it off the event loop.
+        await asyncio.to_thread(show_preview, tool, data)
         while True:
             answer = await asyncio.to_thread(
                 ask, "allow? [y] once  [a] always this tool  [n] no  [v] view input: "
