@@ -66,10 +66,12 @@ Every tool call is presented for approval before it runs:
 ```
 Tool request: Bash
   git status --short
-allow? [y] once  [a] always this tool  [n] no  [v] view input:
+allow? [y] once  [a] always this exact call  [t] always any Bash  [n] no  [v] view input:
 ```
 
-`y` allows this one call, `a` allows that tool for the rest of the session, `n` denies it and then offers to attach a reason that is passed back to the model, and `v` prints the tool's full input as JSON when the one-line summary is not enough to decide.
+`y` allows this one call. `a` allows this exact call for the rest of the session, and means the call and not the tool: approving `git status --short` approves `git status --short`, and the next Bash command is a new question. `t` is the blanket answer, allowing every call to that tool for the rest of the session, which for `Bash` means every shell command; it says so when you pick it. `n` denies the call and then offers to attach a reason that is passed back to the model, and `v` prints the tool's full input as JSON when the one-line summary is not enough to decide.
+
+Two calls count as the same call when their inputs match, ignoring the `description` field, which the model rewords freely without changing what runs.
 
 A call that would change a file shows the change itself, as a diff, so you are never asked "may I edit this file" without being told how:
 
@@ -80,12 +82,14 @@ Tool request: Edit
   -beta
   +BETA
    gamma
-allow? [y] once  [a] always this tool  [n] no  [v] view input:
+allow? [y] once  [a] always this exact call  [t] always any Edit  [n] no  [v] view input:
 ```
 
 `Edit` diffs the text being replaced against its replacement, and says so when the edit replaces every occurrence rather than one. `Write` diffs the file on disk against the new contents, or prints the whole thing as an addition when the file does not exist yet. `NotebookEdit` prints the new cell source and says which cell it lands in and whether it is being inserted, replaced, or deleted. Tools that do not write files -- `Bash`, `Read`, `Grep` and the rest -- are unchanged; the one-line summary is all they get.
 
-The preview stops at 60 lines so that a large rewrite cannot scroll the question off the screen. When it is cut short it says how much was left out, and `v` still shows the entire input. A tool you have approved for the whole session with `a` prints its one-line announcement only, without the diff; the tool result that follows reports what changed.
+The preview stops at 60 lines so that a large rewrite cannot scroll the question off the screen. When it is cut short it says how much was left out, and `v` still shows the entire input. A call that runs unprompted, because you approved it with `a` or approved its tool with `t`, prints its one-line announcement only, without the diff; the tool result that follows reports what changed.
+
+Note that `a` is of little use on the writing tools. Two edits are the same call only when they change the same text in the same file the same way, which is rare, so `Edit` and `Write` will keep asking. That is the intended direction: a diff you have already read is the thing you approved, and the next one deserves its own look. `t` is there when you want to stop being asked at all.
 
 Once a tool runs, its output is printed under a `[tool result]` header, or `[tool error]` when the call failed. Both go to stderr along with everything else that is not model text. Results are printed in full and are not truncated, so reading a large file prints the whole file.
 

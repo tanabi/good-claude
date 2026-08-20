@@ -20,16 +20,20 @@ Input:
     Ctrl-C interrupts the turn in progress.
 
 Tool approval:
-    Every tool call is presented for approval: allow once, allow that tool for
-    the rest of the session, or deny with an optional reason that is passed
-    back to the model. A call that would change a file shows the change as a
-    diff first, so the question is never "may I edit this file" without an
-    answer to "edit it how". A prompt owns the terminal while it waits, so a tool
-    result arriving mid-prompt is held until you have answered rather than
-    printed on top of the question. This is enforced with a PreToolUse hook
-    rather than the SDK's can_use_tool callback, because it only fires when the
-    CLI's permission rules already evaluate to "ask" -- anything covered by an
-    allow rule in settings would otherwise run unannounced.
+    Every tool call is presented for approval: allow once, allow that exact
+    call for the rest of the session, allow every call to that tool for the
+    rest of the session, or deny with an optional reason that is passed back to
+    the model. Approving a call approves that call and nothing else, so
+    approving `git status` does not also approve every other Bash command; the
+    blanket answer is a separate key. A call that would change a file shows the
+    change as a diff first, so the question is never "may I edit this file"
+    without an answer to "edit it how". A prompt owns the terminal while it
+    waits, so a tool result arriving mid-prompt is held until you have
+    answered rather than printed on top of the question. This is enforced with
+    a PreToolUse hook rather than the SDK's can_use_tool callback, because it
+    only fires when the CLI's permission rules already evaluate to "ask" --
+    anything covered by an allow rule in settings would otherwise run
+    unannounced.
 
 Sessions:
     The session id is appended to ~/.good-claude/session-history.txt, so a
@@ -77,9 +81,18 @@ HISTORY_PATH = os.path.expanduser("~/.good-claude/session-history.txt")
 PREVIEW_LINES = 60
 # Lines of unchanged context around each change in a preview diff.
 PREVIEW_CONTEXT = 3
+# Input fields that only describe a call to the reader and do not change what it
+# does. The model rewords these freely, which would otherwise make a call the
+# user already approved for the session look like a new one.
+COSMETIC_FIELDS = ("description",)
 
-# Tools the user has approved for the rest of this session.
-session_allowed: set[str] = set()
+# Exact tool calls the user has approved for the rest of this session, keyed by
+# signature(). "Always" means this call, not this tool: approving `git status`
+# must not also approve `rm -rf /`, since both are Bash.
+session_allowed_calls: set[str] = set()
+# Whole tools the user has approved for the rest of this session. Deliberately
+# a separate, more emphatic answer than approving one call.
+session_allowed_tools: set[str] = set()
 # Held by whoever is writing to the terminal: an approval prompt while it waits
 # for an answer, or the turn loop while it prints. One tool's result arrives
 # while the next tool's prompt is up, so without this they land on top of each
@@ -186,6 +199,17 @@ def summarize(tool: str, data: dict[str, Any]) -> str:
     return json.dumps(data)[:400]
 
 
+def signature(tool: str, data: dict[str, Any]) -> str:
+    """A stable key for one exact tool call, for the session allow list.
+
+    Keyed on the whole input rather than the tool name, so approving a call
+    approves that call and nothing else. Cosmetic fields are dropped: they can
+    differ between two runs of what is, to the machine, the same call.
+    """
+    material = {k: v for k, v in data.items() if k not in COSMETIC_FIELDS}
+    return "%s %s" % (tool, json.dumps(material, sort_keys=True, default=str))
+
+
 def diff_lines(before: str, after: str, hunks: bool) -> list[str]:
     """Unified diff of two strings, without the ---/+++ file headers.
 
@@ -288,7 +312,7 @@ async def pre_tool_use(
     data = input_data.get("tool_input") or {}
 
     async with screen_lock:
-        if tool in session_allowed:
+        if tool in session_allowed_tools or signature(tool, data) in session_allowed_calls:
             meta("[%s: %s]" % (tool, summarize(tool, data)))
             return decision("allow", "Allowed for this session by the user.")
 
@@ -297,10 +321,14 @@ async def pre_tool_use(
         meta("  %s" % summarize(tool, data))
         # Reads the file being written, so keep it off the event loop.
         await asyncio.to_thread(show_preview, tool, data)
+        # `a` is the narrow answer and `t` the broad one, because the narrow one
+        # is what is almost always wanted and so gets the obvious key.
+        question = (
+            "allow? [y] once  [a] always this exact call  "
+            "[t] always any %s  [n] no  [v] view input: " % tool
+        )
         while True:
-            answer = await asyncio.to_thread(
-                ask, "allow? [y] once  [a] always this tool  [n] no  [v] view input: "
-            )
+            answer = await asyncio.to_thread(ask, question)
             if answer is None:
                 meta("")
                 return decision("deny", "The user ended input without approving.")
@@ -308,7 +336,11 @@ async def pre_tool_use(
             if answer in ("y", "yes"):
                 return decision("allow", "Approved by the user.")
             if answer in ("a", "always"):
-                session_allowed.add(tool)
+                session_allowed_calls.add(signature(tool, data))
+                return decision("allow", "Approved by the user for this session.")
+            if answer in ("t", "tool"):
+                session_allowed_tools.add(tool)
+                meta("Every %s call runs unprompted for the rest of this session." % tool)
                 return decision("allow", "Approved by the user for this session.")
             if answer in ("n", "no"):
                 reason = await asyncio.to_thread(ask, "reason (optional): ")
@@ -317,7 +349,7 @@ async def pre_tool_use(
             if answer in ("v", "view"):
                 meta(json.dumps(data, indent=2))
             else:
-                meta("Answer y, a, n, or v.")
+                meta("Answer y, a, t, n, or v.")
 
 
 def result_text(content: str | list[dict[str, Any]] | None) -> str:
