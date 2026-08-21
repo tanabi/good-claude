@@ -17,7 +17,9 @@ Input:
     is sent by accident and pasted text arrives as a single prompt. Ctrl-D on
     an empty line sends what you have typed so far; Ctrl-D with nothing typed
     does nothing. Quitting takes an explicit `/quit` on a line of its own.
-    Ctrl-C interrupts the turn in progress.
+    Ctrl-C interrupts the turn in progress. One thread owns stdin for the whole
+    session and decides what each typed line is for, so a tool asking for
+    approval and a message being composed can never race for the same line.
 
 Tool approval:
     Every tool call is presented for approval: allow once, allow that exact
@@ -29,7 +31,11 @@ Tool approval:
     change as a diff first, so the question is never "may I edit this file"
     without an answer to "edit it how". A prompt owns the terminal while it
     waits, so a tool result arriving mid-prompt is held until you have
-    answered rather than printed on top of the question. This is enforced with
+    answered rather than printed on top of the question. A tool the model
+    started in the background can ask while you are back at the message prompt;
+    it says so, and one Enter gets you to the question with your typed text
+    kept. Answering a pending approval always comes before sending a message,
+    since the model is blocked on it. This is enforced with
     a PreToolUse hook rather than the SDK's can_use_tool callback, because it
     only fires when the CLI's permission rules already evaluate to "ask" --
     anything covered by an allow rule in settings would otherwise run
@@ -54,7 +60,9 @@ import json
 import os
 import readline  # noqa: F401  (gives input() editing and history)
 import sys
+import threading
 import time
+from collections import deque
 from typing import Any
 
 from claude_agent_sdk import (
@@ -99,6 +107,41 @@ session_allowed_tools: set[str] = set()
 # other. It also serializes the prompts themselves, since parallel tool calls
 # fire hooks concurrently.
 screen_lock = asyncio.Lock()
+
+
+class Approval:
+    """One tool call waiting for the user's answer.
+
+    Made on the event loop by the hook that needs the answer, answered on the
+    reader thread, which resolves the future back on the loop.
+    """
+
+    def __init__(self, tool: str, data: dict[str, Any], future: asyncio.Future) -> None:
+        """Record the call and the future its answer is delivered through."""
+        self.tool = tool
+        self.data = data
+        self.future = future
+
+
+# Exactly one thread ever calls input(): the reader started by main(). Two
+# things want typed lines -- the message being composed and an approval prompt
+# for a tool call -- and a tool the model started in the background asks for
+# approval whenever it happens to run, which is usually while the message
+# prompt is already blocked in input(). Two threads inside input() at once are
+# serialized by readline's own lock, so each line goes to whichever one won the
+# race: the answer to the approval disappears into the half-typed message and
+# the prompt looks wedged, re-asking forever. Every read goes through the
+# reader thread instead, one line at a time, and the state below tells it what
+# the next line is for. A waiting approval is always served first.
+input_cv = threading.Condition()
+pending_approvals: deque[Approval] = deque()
+# Set while the message loop is waiting for a message.
+composing = False
+# Set while the reader is blocked in input() for a line of a message. An
+# approval that arrives then cannot be shown until that line is finished, so
+# the user is told to press Enter to get to it.
+composer_reading = False
+reader_stopping = False
 # Set when a turn produces text, so an empty turn can fall back to the result.
 turn_had_text = False
 # Last character written to stdout, so turns are separated by exactly one blank line.
@@ -147,46 +190,110 @@ def ask(prompt: str) -> str | None:
         return None
 
 
-def read_prompt() -> str | None:
-    """Read one multi-line prompt. Enter adds a line, Ctrl-D sends.
+def read_line(prompt: str) -> str | None:
+    """Read one line of a message. None means Ctrl-D.
 
-    Returns None only when there is no more input to read at all, which for an
-    interactive terminal never happens: Ctrl-D on an empty buffer is ignored so
-    the session cannot be quit by accident.
+    The prompt is passed to input(), which writes it to stdout, so the caller
+    passes one only when stdout is a terminal: a redirected transcript holds
+    model text and nothing else.
     """
-    tty = sys.stdout.isatty()
-    lines: list[str] = []
-    while True:
-        try:
-            line = input("> " if (tty and not lines) else "")
-            command = line.strip().lower()
-            # A typed alternative to Ctrl-D, which also makes the client
-            # scriptable: piped input has no way to send an EOF mid-stream.
-            if command == "/send":
-                break
-            if command in QUIT_COMMANDS:
-                # Never discard typed text on a stray /quit.
-                if lines:
-                    meta("Unsent text above. Send it, or /discard it, then /quit.")
-                    continue
-                return None
-            if command == "/discard":
-                lines.clear()
-                meta("(discarded)")
-                continue
-            lines.append(line)
-        except EOFError:
-            meta("")
-            if lines:
-                break
-            if not sys.stdin.isatty():
-                return None
-            meta("Nothing to send. Type /quit on its own line to exit.")
-            continue
+    try:
+        return input(prompt)
+    except EOFError:
+        return None
 
-    while lines and not lines[-1].strip():
-        lines.pop()
-    return "\n".join(lines)
+
+def join_lines(lines: list[str]) -> str:
+    """One message from the typed lines, minus the trailing blank ones."""
+    kept = list(lines)
+    while kept and not kept[-1].strip():
+        kept.pop()
+    return "\n".join(kept)
+
+
+def request_prompt() -> None:
+    """Tell the reader the message loop is waiting for a message."""
+    global composing
+    with input_cv:
+        composing = True
+        input_cv.notify()
+
+
+def deliver_prompt(
+    loop: asyncio.AbstractEventLoop, prompts: asyncio.Queue, text: str | None
+) -> None:
+    """Hand a finished message, or None to quit, to the message loop."""
+    global composing
+    with input_cv:
+        composing = False
+    loop.call_soon_threadsafe(prompts.put_nowait, text)
+
+
+def stop_reader() -> None:
+    """Tell the reader to stop once it is not mid-line."""
+    global reader_stopping
+    with input_cv:
+        reader_stopping = True
+        input_cv.notify()
+
+
+def queue_approval(approval: Approval) -> bool:
+    """Give a tool call to the reader thread.
+
+    True when the reader is already blocked on a line of a message, in which
+    case the question cannot be shown until that line is finished.
+    """
+    with input_cv:
+        pending_approvals.append(approval)
+        input_cv.notify()
+        return composer_reading
+
+
+def resolve_approval(approval: Approval, answer: dict[str, Any]) -> None:
+    """Give a waiting hook its answer. Runs on the event loop."""
+    if not approval.future.done():
+        approval.future.set_result(answer)
+
+
+def abandon_approvals() -> None:
+    """Deny every unanswered call, so no tool is left waiting at exit."""
+    with input_cv:
+        waiting = list(pending_approvals)
+        pending_approvals.clear()
+    for approval in waiting:
+        resolve_approval(approval, decision("deny", "good-claude is exiting."))
+
+
+def next_input_work() -> Approval | str:
+    """Block until there is a line to read.
+
+    Returns the approval to ask about, "message" for a line of the message
+    being composed, or "stop" when the session is over.
+    """
+    with input_cv:
+        while True:
+            if reader_stopping:
+                return "stop"
+            if pending_approvals:
+                return pending_approvals.popleft()
+            if composing:
+                return "message"
+            input_cv.wait()
+
+
+def hold_screen(loop: asyncio.AbstractEventLoop) -> None:
+    """Take the terminal lock from the reader thread.
+
+    screen_lock belongs to the event loop and cannot be taken with `with` from
+    another thread. Scheduling the acquire and waiting for it here keeps the
+    loop free to service the SDK connection while the user reads the question.
+    """
+    asyncio.run_coroutine_threadsafe(screen_lock.acquire(), loop).result()
+
+
+def release_screen(loop: asyncio.AbstractEventLoop) -> None:
+    """Give the terminal lock back. Releasing is not itself thread-safe."""
+    loop.call_soon_threadsafe(screen_lock.release)
 
 
 def summarize(tool: str, data: dict[str, Any]) -> str:
@@ -293,6 +400,7 @@ def show_preview(tool: str, data: dict[str, Any]) -> None:
 
 
 def decision(kind: str, reason: str) -> dict[str, Any]:
+    """A PreToolUse hook result allowing or denying one call."""
     return {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -316,40 +424,149 @@ async def pre_tool_use(
             meta("[%s: %s]" % (tool, summarize(tool, data)))
             return decision("allow", "Allowed for this session by the user.")
 
-        meta("")
-        meta("Tool request: %s" % tool)
-        meta("  %s" % summarize(tool, data))
-        # Reads the file being written, so keep it off the event loop.
-        await asyncio.to_thread(show_preview, tool, data)
-        # `a` is the narrow answer and `t` the broad one, because the narrow one
-        # is what is almost always wanted and so gets the obvious key.
-        question = (
-            "allow? [y] once  [a] always this exact call  "
-            "[t] always any %s  [n] no  [v] view input: " % tool
-        )
-        while True:
-            answer = await asyncio.to_thread(ask, question)
-            if answer is None:
-                meta("")
-                return decision("deny", "The user ended input without approving.")
-            answer = answer.strip().lower()
-            if answer in ("y", "yes"):
-                return decision("allow", "Approved by the user.")
-            if answer in ("a", "always"):
-                session_allowed_calls.add(signature(tool, data))
-                return decision("allow", "Approved by the user for this session.")
-            if answer in ("t", "tool"):
-                session_allowed_tools.add(tool)
-                meta("Every %s call runs unprompted for the rest of this session." % tool)
-                return decision("allow", "Approved by the user for this session.")
-            if answer in ("n", "no"):
-                reason = await asyncio.to_thread(ask, "reason (optional): ")
-                reason = (reason or "").strip()
-                return decision("deny", reason or "The user denied this tool call.")
-            if answer in ("v", "view"):
-                meta(json.dumps(data, indent=2))
-            else:
-                meta("Answer y, a, t, n, or v.")
+    # The reader thread does the asking, because it is the only thread allowed
+    # to read stdin. The screen lock must not be held while waiting for the
+    # answer, or the reader could never take it to print the question.
+    approval = Approval(tool, data, asyncio.get_running_loop().create_future())
+    if queue_approval(approval):
+        async with screen_lock:
+            meta("")
+            meta("[%s needs approval -- press Enter to answer]" % tool)
+    return await approval.future
+
+
+def approval_answer(approval: Approval) -> dict[str, Any]:
+    """Show one tool call and read the user's decision. Reader thread only."""
+    tool = approval.tool
+    data = approval.data
+    meta("")
+    meta("Tool request: %s" % tool)
+    meta("  %s" % summarize(tool, data))
+    show_preview(tool, data)
+    # `a` is the narrow answer and `t` the broad one, because the narrow one is
+    # what is almost always wanted and so gets the obvious key.
+    question = (
+        "allow? [y] once  [a] always this exact call  "
+        "[t] always any %s  [n] no  [v] view input: " % tool
+    )
+    ends = 0
+    while True:
+        answer = ask(question)
+        if answer is None:
+            meta("")
+            ends += 1
+            # Ctrl-D is how a message is sent, so it arrives here by accident
+            # whenever a background tool interrupts one. Taking the first one as
+            # a denial turned a stray keystroke into a rejection, which the
+            # model would answer by asking for the same tool again.
+            if sys.stdin.isatty() and ends < 3:
+                meta("Ctrl-D is not an answer. Answer y, a, t, n, or v; n denies the call.")
+                continue
+            return decision("deny", "The user ended input without approving.")
+        answer = answer.strip().lower()
+        if answer in ("y", "yes"):
+            return decision("allow", "Approved by the user.")
+        if answer in ("a", "always"):
+            session_allowed_calls.add(signature(tool, data))
+            return decision("allow", "Approved by the user for this session.")
+        if answer in ("t", "tool"):
+            session_allowed_tools.add(tool)
+            meta("Every %s call runs unprompted for the rest of this session." % tool)
+            return decision("allow", "Approved by the user for this session.")
+        if answer in ("n", "no"):
+            reason = ask("reason (optional): ")
+            reason = (reason or "").strip()
+            return decision("deny", reason or "The user denied this tool call.")
+        if answer in ("v", "view"):
+            meta(json.dumps(data, indent=2))
+        else:
+            meta("Answer y, a, t, n, or v.")
+
+
+def serve_approval(
+    loop: asyncio.AbstractEventLoop, approval: Approval, held: int
+) -> None:
+    """Ask about one tool call, owning the terminal until it is answered."""
+    hold_screen(loop)
+    try:
+        answer = approval_answer(approval)
+    finally:
+        release_screen(loop)
+    loop.call_soon_threadsafe(resolve_approval, approval, answer)
+    if held:
+        meta("(back to your message, %d line%s so far)" % (held, "" if held == 1 else "s"))
+
+
+def input_loop(loop: asyncio.AbstractEventLoop, prompts: asyncio.Queue) -> None:
+    """Read every line the session needs and decide what each one is for.
+
+    The only place in the program that calls input(). It alternates between the
+    message being composed and approval prompts for tool calls, which a
+    background tool can raise at any moment. An approval is always served
+    first, and the message being composed survives the interruption untouched.
+    """
+    global composer_reading
+    lines: list[str] = []
+    while True:
+        work = next_input_work()
+        if work == "stop":
+            return
+        if isinstance(work, Approval):
+            serve_approval(loop, work, len(lines))
+            continue
+
+        tty = sys.stdout.isatty()
+        with input_cv:
+            composer_reading = True
+        try:
+            line = read_line("> " if (tty and not lines) else "")
+        finally:
+            with input_cv:
+                composer_reading = False
+
+        if line is None:
+            meta("")
+            # Ctrl-D. A waiting approval comes first: the model is blocked on it
+            # and a new message cannot be sent while a tool is mid-flight. The
+            # typed text is kept, so the send is one more Ctrl-D away.
+            if pending_approvals:
+                continue
+            if lines:
+                deliver_prompt(loop, prompts, join_lines(lines))
+                lines = []
+                continue
+            if not sys.stdin.isatty():
+                deliver_prompt(loop, prompts, None)
+                return
+            meta("Nothing to send. Type /quit on its own line to exit.")
+            continue
+
+        command = line.strip().lower()
+        # A typed alternative to Ctrl-D, which also makes the client scriptable:
+        # piped input has no way to send an EOF mid-stream.
+        if command == "/send":
+            if pending_approvals:
+                meta("Answer the tool approval first. Your message is kept.")
+                continue
+            deliver_prompt(loop, prompts, join_lines(lines))
+            lines = []
+            continue
+        if command in QUIT_COMMANDS:
+            # Never discard typed text on a stray /quit.
+            if lines:
+                meta("Unsent text above. Send it, or /discard it, then /quit.")
+                continue
+            deliver_prompt(loop, prompts, None)
+            return
+        if command == "/discard":
+            lines.clear()
+            meta("(discarded)")
+            continue
+        # A bare Enter typed only to reach a waiting approval prompt is not part
+        # of the message.
+        if pending_approvals and not lines and not line.strip():
+            continue
+        lines.append(line)
 
 
 def result_text(content: str | list[dict[str, Any]] | None) -> str:
@@ -403,6 +620,7 @@ async def run_turn(client: ClaudeSDKClient, prompt: str) -> str | None:
 
 
 async def main(resume: str | None) -> int:
+    """Connect, then trade prompts for turns until the user quits."""
     options = ClaudeAgentOptions(
         cwd=os.getcwd(),
         model=os.environ.get("GOOD_CLAUDE_MODEL") or None,
@@ -420,8 +638,18 @@ async def main(resume: str | None) -> int:
         },
     )
 
+    prompts: asyncio.Queue[str | None] = asyncio.Queue()
     client = ClaudeSDKClient(options=options)
     await client.connect()
+    # Daemon, because it can be blocked in input() when the process ends and a
+    # reader waiting on a human must not hold up the exit.
+    reader = threading.Thread(
+        target=input_loop,
+        args=(asyncio.get_running_loop(), prompts),
+        name="stdin-reader",
+        daemon=True,
+    )
+    reader.start()
     meta("good-claude: connected in %s" % os.getcwd())
     meta("good-claude: Enter starts a new line; Ctrl-D on an empty line sends.")
     meta("good-claude: /send also sends, /discard drops what you have typed.")
@@ -431,9 +659,12 @@ async def main(resume: str | None) -> int:
     session_id = None
     try:
         while True:
+            request_prompt()
             try:
-                prompt = await asyncio.to_thread(read_prompt)
+                prompt = await prompts.get()
             except KeyboardInterrupt:
+                # The reader still holds whatever was typed; wait for it again
+                # rather than starting a second reader on the same terminal.
                 meta("")
                 continue
             if prompt is None:
@@ -451,6 +682,8 @@ async def main(resume: str | None) -> int:
                 meta("")
                 meta("(interrupted)")
     finally:
+        stop_reader()
+        abandon_approvals()
         await client.disconnect()
         if session_id:
             meta("good-claude: resume this conversation with: good-claude --resume %s" % session_id)

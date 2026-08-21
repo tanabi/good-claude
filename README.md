@@ -46,6 +46,8 @@ Run it from the directory you want to work in. Your working directory matters ex
 
 Typing works like a text box, not like a chat prompt. Enter only ever starts a new line, so a stray Enter cannot fire off a half-written message, and pasted multi-line text arrives as one prompt rather than as a dozen accidental ones. When the message is ready, press Ctrl-D on an empty line to send it. Ctrl-D with nothing typed does nothing at all.
 
+One thread owns the keyboard for the whole session and decides what each line you type is for, so a tool asking for approval and a message you are composing can never both be reading. If a tool the model started in the background asks for approval while you are typing, you are told so, and one Enter takes you to the question with your typed text kept exactly as it was.
+
 Four commands are recognized, each on a line of its own:
 
 - `/send` sends the message, the same as Ctrl-D. It is also what makes the client scriptable, since piped input has no way to deliver an EOF mid-stream.
@@ -93,6 +95,14 @@ Note that `a` is of little use on the writing tools. Two edits are the same call
 
 Once a tool runs, its output is printed under a `[tool result]` header, or `[tool error]` when the call failed. Both go to stderr along with everything else that is not model text. Results are printed in full and are not truncated, so reading a large file prints the whole file.
 
+A tool the model started in the background runs whenever it runs, which is usually after the turn has ended and you are back at the message prompt. When one of those asks for approval, it says so:
+
+```
+> [Bash needs approval -- press Enter to answer]
+```
+
+Press Enter and the question appears. Whatever you had typed is still there, and after you answer you are told how much of it is waiting. Answering comes before sending: while a question is pending, Ctrl-D and `/send` hand the terminal to it rather than sending the message, because the model is blocked on the answer. Ctrl-D is not an answer to an approval, since it is the send key and lands there by accident; it says so and asks again, and `n` is how you deny.
+
 This is enforced with a `PreToolUse` hook rather than the SDK's `can_use_tool` callback. That distinction matters: `can_use_tool` only fires when the CLI's permission rules already evaluate to "ask", so any tool covered by an allow rule in your settings would run without ever being announced. The hook sees every call regardless of permission rules. Approval prompts are serialized, so parallel tool calls queue up rather than fighting over your terminal. A prompt also owns the terminal while it waits: anything the turn wants to print, including the previous tool's result, is held until you have answered, so nothing is dumped on top of the question you are being asked.
 
 ## Environment
@@ -104,4 +114,6 @@ This is enforced with a `PreToolUse` hook rather than the SDK's `can_use_tool` c
 
 MCP servers are not configured by this client and have not been tested with it. Skills that fan out to subagents have not been tested either; whether a subagent's tool calls surface their own approval prompts is unverified.
 
-Ctrl-C during a turn and terminal paste behavior both need a real terminal to exercise, so neither is covered by the piped-input testing this was built with.
+Ctrl-C during a turn does not currently interrupt the turn. The signal arrives while the event loop is idle, so it propagates out of `asyncio.run` instead of into the handler that would call `interrupt()`, and the client exits with status 130. Anything you had typed goes with it.
+
+Terminal paste behavior needs a real terminal to exercise, so it is not covered by the piped-input testing this was built with.

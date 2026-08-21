@@ -57,6 +57,14 @@ project.
    switch to `can_use_tool`.
 9. **Tool output is not truncated.** Reading a large file prints the whole
    file. The user asked for the text.
+10. **Exactly one thread reads stdin.** `input_loop` is the only place in the
+    program that may call `input()`. Two things want typed lines -- the message
+    being composed and an approval prompt -- and a tool started in the
+    background raises its prompt while the message prompt is already blocked in
+    `input()`. Two threads inside `input()` are serialized by readline's own
+    lock, so each line goes to whichever one won the race: the answer vanishes
+    into the half-typed message and the prompt re-asks forever. Anything that
+    needs a line asks `input_loop` for it.
 
 ## Concurrency
 
@@ -66,8 +74,18 @@ hooks concurrently, and one tool's result arrives while the next tool's prompt
 is up, so any new code that writes to the terminal from inside the message loop
 or a hook must take that lock.
 
-Blocking calls -- `input()`, file reads inside a hook -- run under
-`asyncio.to_thread` so the event loop keeps servicing the SDK connection.
+Blocking calls that are not reads of stdin -- file reads, for instance -- run
+under `asyncio.to_thread` so the event loop keeps servicing the SDK connection.
+Reads of stdin belong to the reader thread (rule 10): the `PreToolUse` hook
+hands its question to that thread through `queue_approval` and waits on a
+future, and the thread prints and asks. Because the thread is not the event
+loop, it takes `screen_lock` through `hold_screen` / `release_screen`, which
+schedule the acquire and the release on the loop; `screen_lock` is an
+`asyncio.Lock` and must not be turned into a `threading.Lock`, or a prompt
+waiting on a human would freeze the SDK connection.
+
+The reader is a daemon thread. It can be sitting in `input()` when the process
+ends, and a reader waiting on a human must not hold up the exit.
 
 ## Style
 
@@ -88,6 +106,14 @@ There is no test suite. The client is exercised by hand:
 
 - Piped input covers the scriptable path, since piped stdin cannot deliver an
   EOF mid-stream: `printf '%s\n' 'say hi' '/send' '/quit' | ./good-claude`.
+  Extra lines after `/send` answer approval prompts, so a tool call can be
+  driven the same way.
+- The input machinery can be driven without the SDK: import the script with
+  `importlib`, start `input_loop` on a thread, and type at it through a pty.
+  Give it a pty for stdin and a pipe for stdout. macOS links readline against
+  libedit, which returns an empty line for everything when it reads a pty slave
+  from a thread, and `input()` only reaches readline when stdout is a terminal
+  too.
 - Ctrl-C during a turn, Ctrl-D sending, terminal paste, and readline editing
   need a real terminal and can only be checked interactively.
 - Check the stdout/stderr split on any change that prints:
@@ -98,6 +124,12 @@ When a change touches behavior the README describes, update the README, the
 module docstring, and this file together.
 
 ## Known gaps
+
+Ctrl-C does not interrupt a turn. The signal is delivered while the event loop
+is idle, so it propagates out of `asyncio.run` rather than into the
+`except KeyboardInterrupt` in `main`, and the process exits 130 with any typed
+text lost. Fixing it means `loop.add_signal_handler` plus running the turn as a
+cancellable task; the handlers in `main` are dead code until then.
 
 MCP servers are not configured by this client and are untested. Skills that fan
 out to subagents are untested; whether a subagent's tool calls surface their own
