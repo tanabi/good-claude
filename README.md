@@ -48,6 +48,10 @@ Typing works like a text box, not like a chat prompt. Enter only ever starts a n
 
 One thread owns the keyboard for the whole session and decides what each line you type is for, so a tool asking for approval and a message you are composing can never both be reading. If a tool the model started in the background asks for approval while you are typing, you are told so, and one Enter takes you to the question with your typed text kept exactly as it was.
 
+Paste is deliberately kept boring. Terminals can wrap pasted text in invisible markers, called bracketed paste, so that a program can tell a paste from typing. Python's line editor is GNU readline on most Linux systems but libedit on macOS, and on any python3 installed by Homebrew or linuxbrew, wherever it runs. libedit does not understand those markers: it swallows part of each one and leaves the rest in your message, so a pasted paragraph turns up with `0~` stuck to the front and a stray `1~` line behind it, and the mangled escape goes on to scramble the terminal. That is why the corruption follows the machine rather than what you copied, and why it shows up over ssh to a Mac first. This client turns the mode off before every read, so a paste is delivered as ordinary keystrokes. It loses nothing, because Enter is never send here: a paste full of newlines was already safe.
+
+The client also keeps the `claude` process it spawns off your terminal. Left alone, that process inherits this one's stderr and writes to your screen whenever it likes -- including terminal control sequences -- in the middle of a message you are halfway through typing. Its output is read through a pipe instead, stripped of control characters, and printed as `[claude] ...` lines along with everything else on stderr.
+
 Four commands are recognized, each on a line of its own:
 
 - `/send` sends the message, the same as Ctrl-D. It is also what makes the client scriptable, since piped input has no way to deliver an EOF mid-stream.
@@ -95,7 +99,25 @@ Note that `a` is of little use on the writing tools. Two edits are the same call
 
 Once a tool runs, its output is printed under a `[tool result]` header, or `[tool error]` when the call failed. Both go to stderr along with everything else that is not model text. Results are printed in full and are not truncated, so reading a large file prints the whole file.
 
-A tool the model started in the background runs whenever it runs, which is usually after the turn has ended and you are back at the message prompt. When one of those asks for approval, it says so:
+When the model delegates work to a subagent, the call is rewritten to run in the foreground, and the client says so:
+
+```
+[Agent: kept in the foreground]
+[agent started: review the diff]
+[agent completed: review the diff]
+```
+
+Backgrounding an agent only pays for itself if you have a second conversation to get on with while it works. This client has one terminal, one prompt, and one thread reading it, so there is nothing to get on with; all backgrounding buys you is the prompt coming back early and the agent's findings turning up later, attached to whatever you happened to say next. Run in the foreground and the result arrives inside the turn that asked for it. Set `GOOD_CLAUDE_BACKGROUND_AGENTS=1` if you would rather the model decide for itself.
+
+This is done by rewriting the tool call in the `PreToolUse` hook, not by asking the model nicely, so it holds regardless of what the model intended. The approval prompt shows the rewritten call, so what you approve is what runs. Backgrounded shells are left alone -- a dev server or a `tail -f` is meant to outlive the call that started it, and forcing one to finish first would hang the turn forever.
+
+If an agent does run in the background, the turn is not over at the model's first reply: the agent keeps running, and finishing wakes the model again to report what it found. The client waits for that rather than handing you the prompt in the middle of it, and says what it is waiting for:
+
+```
+[waiting for 1 agent to finish: review the diff]
+```
+
+An approval can still reach you at the message prompt in one case: an agent that finishes just before the turn's own result is no longer counted as running, so a follow-up from it can arrive after the prompt is back. When that happens the prompt says so:
 
 ```
 > [Bash needs approval -- press Enter to answer]
@@ -109,11 +131,16 @@ This is enforced with a `PreToolUse` hook rather than the SDK's `can_use_tool` c
 
 - `GOOD_CLAUDE_MODEL` picks a model, for example `haiku` or `sonnet`. Defaults to whatever your CLI is configured to use.
 - `GOOD_CLAUDE_THINKING=1` prints thinking text along with the response.
+- `GOOD_CLAUDE_BACKGROUND_AGENTS=1` lets the model run subagents in the background. Off by default, which rewrites those calls to run in the foreground.
 
 ## Limits
 
-MCP servers are not configured by this client and have not been tested with it. Skills that fan out to subagents have not been tested either; whether a subagent's tool calls surface their own approval prompts is unverified.
+MCP servers are not configured by this client and have not been tested with it.
+
+A background agent that finishes before the result of the turn that started it is not counted as still running, so the client can hand back the prompt with a follow-up from that agent still on its way. The signal the wait is built on cannot tell that case apart from no work at all. The prompt is the fallback there, and it is the reason the "press Enter to answer" path is still in the client.
 
 Ctrl-C during a turn does not currently interrupt the turn. The signal arrives while the event loop is idle, so it propagates out of `asyncio.run` instead of into the handler that would call `interrupt()`, and the client exits with status 130. Anything you had typed goes with it.
 
-Terminal paste behavior needs a real terminal to exercise, so it is not covered by the piped-input testing this was built with.
+Text pasted while a turn is running appears on screen twice. Nothing is reading stdin during a turn, so the terminal driver echoes the paste as it arrives; when the turn ends and the prompt comes back, readline reads those same bytes and echoes them again next to the prompt. Your message is correct either way -- only the display repeats -- but a long paste mid-turn looks like the screen has doubled everything, which it has. Pasting at the prompt instead of mid-turn avoids it. Fixing it properly means turning the terminal's echo off whenever the client is not reading and back on when it is, which is a real terminal-state change with a real failure mode: a crash at the wrong moment leaves the terminal with echo off, and you have to type `stty sane` blind to get it back. That trade has not been made.
+
+Terminal paste behavior needs a real terminal to exercise. It is covered by a pty harness that emulates bracketed-paste mode, but the real terminals, multiplexers, and ssh setups people actually use are not all covered by that.

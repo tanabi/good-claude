@@ -20,6 +20,11 @@ Input:
     Ctrl-C interrupts the turn in progress. One thread owns stdin for the whole
     session and decides what each typed line is for, so a tool asking for
     approval and a message being composed can never race for the same line.
+    Pasted text arrives as plain keystrokes: the terminal's bracketed-paste
+    mode is turned off before each read, because libedit -- which is what
+    Python's readline is on macOS and on any Homebrew python3 -- mangles the
+    markers into the text instead of understanding them. Nothing here needs
+    them, since Enter is never send.
 
 Tool approval:
     Every tool call is presented for approval: allow once, allow that exact
@@ -31,15 +36,26 @@ Tool approval:
     change as a diff first, so the question is never "may I edit this file"
     without an answer to "edit it how". A prompt owns the terminal while it
     waits, so a tool result arriving mid-prompt is held until you have
-    answered rather than printed on top of the question. A tool the model
-    started in the background can ask while you are back at the message prompt;
-    it says so, and one Enter gets you to the question with your typed text
-    kept. Answering a pending approval always comes before sending a message,
-    since the model is blocked on it. This is enforced with
-    a PreToolUse hook rather than the SDK's can_use_tool callback, because it
-    only fires when the CLI's permission rules already evaluate to "ask" --
-    anything covered by an allow rule in settings would otherwise run
-    unannounced.
+    answered rather than printed on top of the question. A tool that manages to
+    ask while you are back at the message prompt says so, and one Enter gets
+    you to the question with your typed text kept. Answering a pending approval
+    always comes before sending a message, since the model is blocked on it.
+    This is enforced with a PreToolUse hook rather than the SDK's can_use_tool
+    callback, because it only fires when the CLI's permission rules already
+    evaluate to "ask" -- anything covered by an allow rule in settings would
+    otherwise run unannounced.
+
+Subagents:
+    Agent calls are rewritten to run in the foreground, so a delegated result
+    comes back inside the turn that asked for it. Backgrounding one only pays
+    off when there is a second conversation to get on with, and there is not:
+    one terminal, one prompt. Set GOOD_CLAUDE_BACKGROUND_AGENTS=1 to allow it.
+    Backgrounded shells are left alone; they are meant to outlive the call.
+
+    When an agent does run in the background, the turn ends at a result with no
+    agent still running rather than at the first result, because a backgrounded
+    agent outlives the turn that started it and wakes the model again when it
+    finishes. The prompt stays down until that has played out.
 
 Sessions:
     The session id is appended to ~/.good-claude/session-history.txt, so a
@@ -49,6 +65,15 @@ Sessions:
 Environment:
     GOOD_CLAUDE_MODEL     model alias or id (default: your configured model)
     GOOD_CLAUDE_THINKING  set to 1 to show thinking text as well
+    GOOD_CLAUDE_BACKGROUND_AGENTS
+                          set to 1 to let the model background subagents
+
+Known gap:
+    Text pasted while a turn is running is echoed twice: once by the terminal
+    driver as it arrives, since nothing is reading stdin then, and again by
+    readline when the prompt comes back and it reads those bytes. The message
+    itself is correct; only the screen repeats. Pasting at the prompt rather
+    than mid-turn avoids it.
 """
 
 from __future__ import annotations
@@ -66,12 +91,16 @@ from collections import deque
 from typing import Any
 
 from claude_agent_sdk import (
+    TERMINAL_TASK_STATUSES,
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
     HookMatcher,
     ResultMessage,
     SystemMessage,
+    TaskNotificationMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
     TextBlock,
     ThinkingBlock,
     ToolResultBlock,
@@ -93,6 +122,26 @@ PREVIEW_CONTEXT = 3
 # does. The model rewords these freely, which would otherwise make a call the
 # user already approved for the session look like a new one.
 COSMETIC_FIELDS = ("description",)
+# Task kinds a turn waits for after its own result arrives. Delegated agent work
+# only: a backgrounded shell -- `tail -f`, a dev server -- is reported through
+# the same lifecycle frames but may never reach a terminal status, so waiting on
+# one would park the session forever instead of briefly. Agent tasks are the
+# ones whose completion wakes the model for a follow-up turn, which is the thing
+# worth waiting for. Mirrors the SDK's own DEFERRING_TASK_TYPES, which is
+# private, so it is restated here rather than imported.
+DEFERRED_TASK_TYPES = frozenset({"local_agent", "local_workflow"})
+# Python's readline is GNU readline on most Linux distributions and libedit
+# (editline) on macOS and on Homebrew/linuxbrew builds anywhere, including on
+# Linux. The two disagree about pasting; see disable_bracketed_paste.
+READLINE_IS_LIBEDIT = "libedit" in (readline.__doc__ or "")
+# DEC private mode 2004 off: deliver a paste as ordinary keystrokes.
+BRACKETED_PASTE_OFF = "\x1b[?2004l"
+# Tools that delegate to a subagent. Named separately from the background shell
+# case, which must keep its own meaning of "background". See foreground_input.
+AGENT_TOOLS = ("Agent", "Task")
+# Backgrounding an agent buys parallel conversations, which this client does not
+# have; set GOOD_CLAUDE_BACKGROUND_AGENTS=1 to let the model background them.
+FORCE_FOREGROUND = os.environ.get("GOOD_CLAUDE_BACKGROUND_AGENTS") != "1"
 
 # Exact tool calls the user has approved for the rest of this session, keyed by
 # signature(). "Always" means this call, not this tool: approving `git status`
@@ -107,6 +156,9 @@ session_allowed_tools: set[str] = set()
 # other. It also serializes the prompts themselves, since parallel tool calls
 # fire hooks concurrently.
 screen_lock = asyncio.Lock()
+# In-flight writes of subprocess stderr, held so the tasks are not collected
+# before they run.
+cli_stderr_tasks: set[asyncio.Task] = set()
 
 
 class Approval:
@@ -121,6 +173,9 @@ class Approval:
         self.tool = tool
         self.data = data
         self.future = future
+        # Set when the call is being rewritten before it runs, so that an
+        # approval carries the rewrite back with it. See foreground_input.
+        self.updated_input: dict[str, Any] | None = None
 
 
 # Exactly one thread ever calls input(): the reader started by main(). Two
@@ -161,6 +216,51 @@ def meta(text: str) -> None:
     sys.stderr.flush()
 
 
+def strip_controls(text: str) -> str:
+    """Text with control characters turned into spaces, tabs kept.
+
+    Applied to output that came from another program. Nothing arriving that way
+    is allowed to move the cursor, set a terminal mode, or open a paste bracket.
+    """
+    return "".join(
+        ch if ch == "\t" or (ch >= " " and ch != "\x7f") else " " for ch in text
+    )
+
+
+async def meta_locked(text: str) -> None:
+    """Print a meta line without cutting into whoever owns the screen."""
+    async with screen_lock:
+        meta(text)
+
+
+def cli_stderr(text: str) -> None:
+    """Print one line the claude subprocess wrote to its own stderr.
+
+    Registering this callback is what makes the SDK give the subprocess a pipe.
+    Without it the SDK passes stderr through, which means the subprocess
+    inherits this program's stderr -- the user's terminal -- and writes to it
+    whenever it likes, including terminal control sequences, on top of a
+    half-typed message that readline is in the middle of displaying. It cannot
+    take screen_lock to avoid that, because it is a different process. Piping
+    it here puts every write back under this program's control, and stripping
+    control characters keeps another program from steering the terminal.
+    """
+    line = strip_controls(text).rstrip()
+    if not line:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        meta("[claude] " + line)
+        return
+    # Called from the SDK's reader task, which is on the loop, so the lock has
+    # to be taken in a task rather than awaited here. The set keeps a strong
+    # reference; a bare create_task can be collected before it runs.
+    task = loop.create_task(meta_locked("[claude] " + line))
+    cli_stderr_tasks.add(task)
+    task.add_done_callback(cli_stderr_tasks.discard)
+
+
 def emit(text: str) -> None:
     """Write model text to stdout with no added newlines."""
     global turn_had_text, last_char
@@ -180,8 +280,39 @@ def emit_block(text: str) -> None:
         emit("\n")
 
 
+def disable_bracketed_paste() -> None:
+    """Make the terminal deliver a paste as ordinary keystrokes.
+
+    In bracketed-paste mode a terminal wraps pasted text in ESC[200~ and
+    ESC[201~ so that a reader can tell it from typing. GNU readline understands
+    those markers. libedit does not: it eats the first few bytes of each escape
+    and leaves the rest in the text, so a pasted paragraph arrives with `0~`
+    welded to its first line and a stray `1~` line after it, and the
+    half-swallowed escape goes on to confuse the terminal itself. That is the
+    paste corruption, and it is why it follows the machine rather than the
+    source of the text: macOS is always libedit, and so is any Homebrew python3
+    on Linux.
+
+    Nothing here wants the markers. Enter is never send (rule 6), so a paste
+    read as plain keystrokes is already safe -- which is the whole reason this
+    client composes the way it does.
+
+    The mode belongs to the terminal, not to this process, and this process
+    does not have it to itself: the claude subprocess shares the terminal and
+    the user's shell may have left the mode on. So it is turned off before
+    every read rather than once at startup. Writing an escape sequence is the
+    one exception to "no ANSI" (rule 3): it sets an input mode instead of
+    drawing anything, it undoes a mode some other program turned on, and it is
+    written only to a terminal, so a redirected log never sees it.
+    """
+    if READLINE_IS_LIBEDIT and sys.stderr.isatty():
+        sys.stderr.write(BRACKETED_PASTE_OFF)
+        sys.stderr.flush()
+
+
 def ask(prompt: str) -> str | None:
     """Prompt on stderr and read a line. None means the input ended (Ctrl-D)."""
+    disable_bracketed_paste()
     sys.stderr.write(prompt)
     sys.stderr.flush()
     try:
@@ -197,6 +328,7 @@ def read_line(prompt: str) -> str | None:
     passes one only when stdout is a terminal: a redirected transcript holds
     model text and nothing else.
     """
+    disable_bracketed_paste()
     try:
         return input(prompt)
     except EOFError:
@@ -399,15 +531,45 @@ def show_preview(tool: str, data: dict[str, Any]) -> None:
         meta("  ... %d more line%s; v shows the whole input" % (extra, "" if extra == 1 else "s"))
 
 
-def decision(kind: str, reason: str) -> dict[str, Any]:
-    """A PreToolUse hook result allowing or denying one call."""
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": kind,
-            "permissionDecisionReason": reason,
-        }
+def decision(
+    kind: str, reason: str, updated_input: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """A PreToolUse hook result allowing or denying one call.
+
+    `updated_input` replaces the input the model asked for; see foreground_input.
+    """
+    output: dict[str, Any] = {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": kind,
+        "permissionDecisionReason": reason,
     }
+    if updated_input is not None:
+        output["updatedInput"] = updated_input
+    return {"hookSpecificOutput": output}
+
+
+def foreground_input(tool: str, data: dict[str, Any]) -> dict[str, Any] | None:
+    """The same agent call run in the foreground, or None to leave it alone.
+
+    A backgrounded agent hands the prompt back while it is still working, and
+    everything it goes on to say arrives in a later turn. That is worth it only
+    if there is a second conversation to get on with, and here there is not:
+    one terminal, one prompt, one thread reading it. So the call is rewritten
+    to run in the foreground, where its result comes back inside the turn that
+    asked for it.
+
+    Only agent tools. `Bash(run_in_background=True)` is a dev server or a
+    `tail -f`, which is meant to outlive the call and would hang the turn
+    forever if it were forced to finish first.
+
+    The tool defaults to running in the background when the field is absent, so
+    anything that is not already an explicit false gets rewritten.
+    """
+    if not FORCE_FOREGROUND or tool not in AGENT_TOOLS:
+        return None
+    if data.get("run_in_background") is False:
+        return None
+    return dict(data, run_in_background=False)
 
 
 async def pre_tool_use(
@@ -419,15 +581,24 @@ async def pre_tool_use(
     tool = input_data.get("tool_name", "?")
     data = input_data.get("tool_input") or {}
 
+    # Done before anything else, so the announcement, the approval prompt, and
+    # the session allow list all describe the call that will actually run.
+    updated = foreground_input(tool, data)
+    if updated is not None:
+        data = updated
+        async with screen_lock:
+            meta("[%s: kept in the foreground]" % tool)
+
     async with screen_lock:
         if tool in session_allowed_tools or signature(tool, data) in session_allowed_calls:
             meta("[%s: %s]" % (tool, summarize(tool, data)))
-            return decision("allow", "Allowed for this session by the user.")
+            return decision("allow", "Allowed for this session by the user.", updated)
 
     # The reader thread does the asking, because it is the only thread allowed
     # to read stdin. The screen lock must not be held while waiting for the
     # answer, or the reader could never take it to print the question.
     approval = Approval(tool, data, asyncio.get_running_loop().create_future())
+    approval.updated_input = updated
     if queue_approval(approval):
         async with screen_lock:
             meta("")
@@ -465,14 +636,18 @@ def approval_answer(approval: Approval) -> dict[str, Any]:
             return decision("deny", "The user ended input without approving.")
         answer = answer.strip().lower()
         if answer in ("y", "yes"):
-            return decision("allow", "Approved by the user.")
+            return decision("allow", "Approved by the user.", approval.updated_input)
         if answer in ("a", "always"):
             session_allowed_calls.add(signature(tool, data))
-            return decision("allow", "Approved by the user for this session.")
+            return decision(
+                "allow", "Approved by the user for this session.", approval.updated_input
+            )
         if answer in ("t", "tool"):
             session_allowed_tools.add(tool)
             meta("Every %s call runs unprompted for the rest of this session." % tool)
-            return decision("allow", "Approved by the user for this session.")
+            return decision(
+                "allow", "Approved by the user for this session.", approval.updated_input
+            )
         if answer in ("n", "no"):
             reason = ask("reason (optional): ")
             reason = (reason or "").strip()
@@ -581,18 +756,65 @@ def result_text(content: str | list[dict[str, Any]] | None) -> str:
     return "\n".join(parts)
 
 
+def end_segment() -> None:
+    """Separate one finished response from whatever is printed next."""
+    global last_char
+    sys.stdout.write("\n" if last_char == "\n" else "\n\n")
+    sys.stdout.flush()
+    last_char = "\n"
+
+
 async def run_turn(client: ClaudeSDKClient, prompt: str) -> str | None:
-    """Send one prompt and print the response. Returns the session id."""
+    """Send one prompt and print the response. Returns the session id.
+
+    A turn is over when a result arrives and no background agent is still
+    running, which is not the same as the first result: an agent started in the
+    background outlives the turn that started it, and its completion wakes the
+    model for a follow-up turn on this same connection. Returning at the first
+    result would put the message prompt up over the top of that, and nothing
+    the agents went on to produce would be read off the connection until the
+    user sent an unrelated message, which then got answered together with the
+    agent output. So the stream is read past the result, and the prompt does
+    not come back until the work behind it is actually finished.
+    """
     global turn_had_text
     turn_had_text = False
     session_id = None
+    # Background agents still running. Local to the turn: a stale id that never
+    # gets a terminal frame is dropped here rather than parking every turn
+    # after it. Names are kept separately and never removed, because the id has
+    # to stay readable in the message announcing that it finished.
+    inflight: set[str] = set()
+    agent_names: dict[str, str] = {}
 
     await client.query(prompt)
     meta("Waiting for response...")
-    async for message in client.receive_response():
+    finished = False
+    async for message in client.receive_messages():
         # Wait out any approval prompt rather than printing over it.
         async with screen_lock:
-            if isinstance(message, AssistantMessage):
+            # The task lifecycle messages subclass SystemMessage, so they have
+            # to be matched before it.
+            if isinstance(message, TaskStartedMessage):
+                if message.task_type in DEFERRED_TASK_TYPES:
+                    name = message.description or message.task_id
+                    agent_names[message.task_id] = name
+                    inflight.add(message.task_id)
+                    meta("[agent started: %s]" % name)
+            # An agent's terminal state arrives as a notification, as a
+            # task_updated patch, or as both in either order, so either one
+            # ends it and whichever lands first is the one that announces it.
+            elif isinstance(message, TaskNotificationMessage):
+                if message.task_id in inflight:
+                    inflight.discard(message.task_id)
+                    meta("[agent %s: %s]"
+                         % (message.status, agent_names[message.task_id]))
+            elif isinstance(message, TaskUpdatedMessage):
+                if message.status in TERMINAL_TASK_STATUSES and message.task_id in inflight:
+                    inflight.discard(message.task_id)
+                    meta("[agent %s: %s]"
+                         % (message.status, agent_names[message.task_id]))
+            elif isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, TextBlock):
                         emit_block(block.text)
@@ -613,9 +835,23 @@ async def run_turn(client: ClaudeSDKClient, prompt: str) -> str | None:
                     emit(message.result)
                 if message.is_error:
                     meta("[error: %s]" % (message.result or message.subtype))
+                end_segment()
+                # Each follow-up turn gets its own fallback to the result text.
+                turn_had_text = False
+                if inflight:
+                    meta(
+                        "[waiting for %d agent%s to finish: %s]"
+                        % (
+                            len(inflight),
+                            "" if len(inflight) == 1 else "s",
+                            "; ".join(agent_names[task] for task in sorted(inflight)),
+                        )
+                    )
+                else:
+                    finished = True
+        if finished:
+            break
 
-    sys.stdout.write("\n" if last_char == "\n" else "\n\n")
-    sys.stdout.flush()
     return session_id
 
 
@@ -627,6 +863,9 @@ async def main(resume: str | None) -> int:
         resume=resume,
         permission_mode="default",
         setting_sources=["user", "project", "local"],
+        # Registering this is what stops the subprocess inheriting the
+        # terminal; see cli_stderr.
+        stderr=cli_stderr,
         hooks={
             "PreToolUse": [
                 HookMatcher(

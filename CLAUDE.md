@@ -38,7 +38,11 @@ project.
    This is the single behavior the project exists to provide.
 3. **No TUI.** No curses, no alternate screen buffer, no cursor positioning, no
    progress spinners, no ANSI color, no redrawing. If a change needs to know
-   the terminal width, it is the wrong change.
+   the terminal width, it is the wrong change. There is exactly one escape
+   sequence in the program, `ESC[?2004l` in `disable_bracketed_paste`, and it
+   is not drawing: it sets an input mode, it exists to undo a mode another
+   program turned on, and it is written only when stderr is a terminal. Adding
+   a second one needs the same standard of justification.
 4. **Print whole segments, not tokens.** Model text is emitted a finished
    message segment at a time. Do not reintroduce a typewriter effect.
 5. **Stay a thin client.** Do not reimplement anything the CLI already does.
@@ -57,7 +61,39 @@ project.
    switch to `can_use_tool`.
 9. **Tool output is not truncated.** Reading a large file prints the whole
    file. The user asked for the text.
-10. **Exactly one thread reads stdin.** `input_loop` is the only place in the
+10. **A turn is not over while a delegated agent is still running.** `run_turn`
+    reads past the first `ResultMessage` and returns only when a result arrives
+    with nothing in flight, because a background agent outlives the turn that
+    started it and its completion wakes the model for a follow-up turn on the
+    same connection. Returning early puts the message prompt up over the middle
+    of that: the agent's output is not read off the connection until the user
+    sends something unrelated, which then gets answered together with it. Track
+    only `DEFERRED_TASK_TYPES`; waiting on a backgrounded shell would park the
+    session forever, since one may never reach a terminal status.
+11. **Nothing else may write to the terminal.** The SDK gives the claude
+    subprocess this process's own stderr unless a `stderr` callback is
+    registered, so without one the subprocess writes to the user's terminal
+    directly -- control sequences included -- on top of a half-typed message,
+    and `screen_lock` cannot stop it because it is a different process.
+    `cli_stderr` keeps it on a pipe and strips control characters from what it
+    prints. Do not drop that callback to "simplify" the options.
+12. **Pasting must survive libedit.** Python's `readline` is libedit on macOS
+    and on any Homebrew/linuxbrew python3, GNU readline on most Linux distros.
+    libedit does not understand bracketed-paste markers and mangles them into
+    the text, so the terminal's paste mode is turned off before every read.
+    Test paste changes on a libedit build specifically; a GNU-readline box will
+    not show the bug.
+13. **Subagents run in the foreground.** `foreground_input` rewrites agent
+    calls through the hook's `updatedInput`, so it holds whatever the model
+    intended. Backgrounding buys parallel conversations, which a single prompt
+    on a single terminal cannot use. The rewrite happens before the
+    announcement, the approval prompt, and the session allow list, so all three
+    describe the call that will actually run. Note the tool backgrounds agents
+    when the field is *absent*, so anything that is not an explicit `false` has
+    to be rewritten. Never extend this to `Bash(run_in_background=True)`: that
+    is a dev server or a `tail -f`, and forcing it to finish first hangs the
+    turn forever.
+14. **Exactly one thread reads stdin.** `input_loop` is the only place in the
     program that may call `input()`. Two things want typed lines -- the message
     being composed and an approval prompt -- and a tool started in the
     background raises its prompt while the message prompt is already blocked in
@@ -76,7 +112,7 @@ or a hook must take that lock.
 
 Blocking calls that are not reads of stdin -- file reads, for instance -- run
 under `asyncio.to_thread` so the event loop keeps servicing the SDK connection.
-Reads of stdin belong to the reader thread (rule 10): the `PreToolUse` hook
+Reads of stdin belong to the reader thread (rule 14): the `PreToolUse` hook
 hands its question to that thread through `queue_approval` and waits on a
 future, and the thread prints and asks. Because the thread is not the event
 loop, it takes `screen_lock` through `hold_screen` / `release_screen`, which
@@ -114,6 +150,22 @@ There is no test suite. The client is exercised by hand:
   libedit, which returns an empty line for everything when it reads a pty slave
   from a thread, and `input()` only reaches readline when stdout is a terminal
   too.
+- Paste needs a libedit python3 and a pty whose parent tracks mode 2004: turn
+  bracketed paste on from the child, paste with the markers only while the mode
+  reads as on, and check the collected message equals what was sent. On a GNU
+  readline build the bug cannot reproduce, and pasting short lines does not
+  reproduce it either -- the markers are the whole story.
+- To see whether anything is writing to the terminal behind the client's back,
+  run it under a pty and grep the captured bytes for escape sequences. The only
+  one that should appear is `ESC[?2004l`.
+- The background-agent wait is driven the same way. Ask for one backgrounded
+  `Agent` call, feed `y` lines to approve it and whatever it runs, and end with
+  `/discard` then `/quit` so leftover answers do not become a second message.
+  The turn is correct when a `[waiting for N background agent...]` line appears
+  after the first response and the agent's findings print before the prompt
+  returns. `run_turn` can also be driven without the CLI: import the script and
+  hand it a fake client whose `receive_messages` yields a scripted list of
+  `TaskStartedMessage` / `ResultMessage` / `TaskNotificationMessage` frames.
 - Ctrl-C during a turn, Ctrl-D sending, terminal paste, and readline editing
   need a real terminal and can only be checked interactively.
 - Check the stdout/stderr split on any change that prints:
@@ -131,6 +183,25 @@ is idle, so it propagates out of `asyncio.run` rather than into the
 text lost. Fixing it means `loop.add_signal_handler` plus running the turn as a
 cancellable task; the handlers in `main` are dead code until then.
 
-MCP servers are not configured by this client and are untested. Skills that fan
-out to subagents are untested; whether a subagent's tool calls surface their own
-approval prompts is unverified.
+MCP servers are not configured by this client and are untested.
+
+Text pasted while a turn is running is echoed twice: once by the tty driver as
+it arrives, because nothing is reading stdin then, and again by readline when
+the prompt returns and reads those bytes. Verified on a pty on both readline
+backends, so it is not the libedit bug and the bracketed-paste fix does not
+touch it. The message text is correct; only the screen doubles. The fix is an
+ECHO toggle around every read via `termios`, which was declined: a crash with
+ECHO off leaves the user typing blind until they run `stty sane`. Revisit only
+with a restore path that survives a crash and a signal.
+
+A subagent's tool calls do surface their own approval prompts, through the same
+`PreToolUse` hook, and are answered as they happen (verified against a
+backgrounded `Agent` call).
+
+The wait on background agents has one hole, which is the SDK's, not this
+client's: an agent that reaches a terminal state *before* the result of the turn
+that started it leaves nothing in flight at that result, so the turn ends and
+the prompt comes back with a continuation still on its way. Nothing in the task
+bookkeeping can tell that apart from no work at all; closing it needs a
+run-boundary signal from the CLI. The "press Enter to answer" path is the
+fallback for exactly this case and must stay.
