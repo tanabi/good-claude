@@ -20,11 +20,21 @@ Input:
     Ctrl-C interrupts the turn in progress. One thread owns stdin for the whole
     session and decides what each typed line is for, so a tool asking for
     approval and a message being composed can never race for the same line.
-    Pasted text arrives as plain keystrokes: the terminal's bracketed-paste
-    mode is turned off before each read, because libedit -- which is what
-    Python's readline is on macOS and on any Homebrew python3 -- mangles the
-    markers into the text instead of understanding them. Nothing here needs
-    them, since Enter is never send.
+
+    Input is read as raw bytes and assembled into lines here, without a line
+    editor. Python's readline is libedit on macOS and on any Homebrew python3,
+    and libedit rewrites a large paste into repeated fragments of itself --
+    verified on the affected machine, where the same 2207-character paste came
+    back the right length with the wrong contents. GNU readline mangled it too,
+    differently. A plain read of the same text on the same terminal was exact,
+    so the line editor is gone. The terminal is taken off canonical mode as
+    well, because that path caps a line at MAX_CANON -- 1024 bytes on macOS --
+    and silently drops the rest.
+
+    What that costs: no history, and no arrow-key editing. What it keeps:
+    backspace, Ctrl-U, Ctrl-W, Ctrl-D, tabs as literal tabs, UTF-8, and pasted
+    text that arrives byte for byte no matter how large it is or whether a turn
+    is running when it lands.
 
 Tool approval:
     Every tool call is presented for approval: allow once, allow that exact
@@ -69,22 +79,22 @@ Environment:
                           set to 1 to let the model background subagents
 
 Known gap:
-    Text pasted while a turn is running is echoed twice: once by the terminal
-    driver as it arrives, since nothing is reading stdin then, and again by
-    readline when the prompt comes back and it reads those bytes. The message
-    itself is correct; only the screen repeats. Pasting at the prompt rather
-    than mid-turn avoids it.
+    The terminal is put in raw mode for the session and restored on the way
+    out, through both a finally and an atexit handler. A hard kill that runs
+    neither leaves the terminal without echo; `stty sane` typed blind restores
+    it.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import difflib
 import json
 import os
-import readline  # noqa: F401  (gives input() editing and history)
 import sys
+import termios
 import threading
 import time
 from collections import deque
@@ -130,11 +140,7 @@ COSMETIC_FIELDS = ("description",)
 # worth waiting for. Mirrors the SDK's own DEFERRING_TASK_TYPES, which is
 # private, so it is restated here rather than imported.
 DEFERRED_TASK_TYPES = frozenset({"local_agent", "local_workflow"})
-# Python's readline is GNU readline on most Linux distributions and libedit
-# (editline) on macOS and on Homebrew/linuxbrew builds anywhere, including on
-# Linux. The two disagree about pasting; see disable_bracketed_paste.
-READLINE_IS_LIBEDIT = "libedit" in (readline.__doc__ or "")
-# DEC private mode 2004 off: deliver a paste as ordinary keystrokes.
+# DEC private mode 2004 off: deliver a paste as ordinary bytes.
 BRACKETED_PASTE_OFF = "\x1b[?2004l"
 # Tools that delegate to a subagent. Named separately from the background shell
 # case, which must keep its own meaning of "background". See foreground_input.
@@ -159,6 +165,20 @@ screen_lock = asyncio.Lock()
 # In-flight writes of subprocess stderr, held so the tasks are not collected
 # before they run.
 cli_stderr_tasks: set[asyncio.Task] = set()
+# Whether there is a terminal to read keys from. Piped input takes a plain
+# readline() instead and never touches terminal modes.
+stdin_is_tty = sys.stdin.isatty()
+# The terminal settings found at startup, restored on the way out.
+saved_terminal_mode: list[Any] | None = None
+# Bytes read from the terminal that are not yet part of a finished line, the
+# line being composed, and the finished lines waiting to be handed out. One
+# read can deliver a whole pasted document, so it has to be held somewhere
+# between reads; the caller still wants one line at a time.
+input_bytes = bytearray()
+current_line = bytearray()
+ready_lines: deque[str] = deque()
+# Set by Ctrl-D on an empty line, cleared when it is reported.
+saw_eof = False
 
 
 class Approval:
@@ -281,58 +301,243 @@ def emit_block(text: str) -> None:
 
 
 def disable_bracketed_paste() -> None:
-    """Make the terminal deliver a paste as ordinary keystrokes.
+    """Make the terminal deliver a paste as ordinary bytes.
 
     In bracketed-paste mode a terminal wraps pasted text in ESC[200~ and
-    ESC[201~ so that a reader can tell it from typing. GNU readline understands
-    those markers. libedit does not: it eats the first few bytes of each escape
-    and leaves the rest in the text, so a pasted paragraph arrives with `0~`
-    welded to its first line and a stray `1~` line after it, and the
-    half-swallowed escape goes on to confuse the terminal itself. That is the
-    paste corruption, and it is why it follows the machine rather than the
-    source of the text: macOS is always libedit, and so is any Homebrew python3
-    on Linux.
+    ESC[201~ so a reader can tell a paste from typing. The reader below does
+    not need to know the difference -- Enter is never send (rule 6), so pasted
+    newlines and typed ones mean the same thing -- and the markers are two more
+    escape sequences that something has to strip. Turning the mode off keeps
+    them out of the stream entirely.
 
-    Nothing here wants the markers. Enter is never send (rule 6), so a paste
-    read as plain keystrokes is already safe -- which is the whole reason this
-    client composes the way it does.
-
-    The mode belongs to the terminal, not to this process, and this process
-    does not have it to itself: the claude subprocess shares the terminal and
-    the user's shell may have left the mode on. So it is turned off before
-    every read rather than once at startup. Writing an escape sequence is the
-    one exception to "no ANSI" (rule 3): it sets an input mode instead of
-    drawing anything, it undoes a mode some other program turned on, and it is
-    written only to a terminal, so a redirected log never sees it.
+    The mode belongs to the terminal, not to this process, and other programs
+    set it: the user's shell does, and so does anything that crashed without
+    putting it back. Written only to a terminal, so a redirected log never
+    sees it.
     """
-    if READLINE_IS_LIBEDIT and sys.stderr.isatty():
+    if sys.stderr.isatty():
         sys.stderr.write(BRACKETED_PASTE_OFF)
         sys.stderr.flush()
 
 
+def enter_raw_mode() -> None:
+    """Take the terminal off canonical input for the rest of the session.
+
+    Canonical mode is the kernel assembling a line for us, and it is not usable
+    here for two reasons. It caps a line at MAX_CANON -- 1024 bytes on macOS,
+    4096 on Linux -- and silently discards the rest, which loses the tail of any
+    pasted paragraph longer than that. And it is what hands the line to a line
+    editor, which on macOS rewrites a large paste into repeated fragments of
+    itself. Reading the bytes directly avoids both.
+
+    Echo goes off with it, because the reader echoes what it accepts. That also
+    ends the double echo of anything typed or pasted during a turn: the kernel
+    is no longer echoing bytes as they land only for the reader to echo them
+    again when it gets to them.
+
+    ISIG stays on, so Ctrl-C still raises a signal rather than arriving as a
+    byte nobody handles. IXON goes off, because a Ctrl-S anywhere inside a
+    pasted document would otherwise freeze the terminal until Ctrl-Q.
+
+    Set once for the session rather than around each read: bytes pasted during
+    a turn then land in the raw queue instead of the canonical one, where the
+    MAX_CANON cap would apply to them.
+    """
+    global saved_terminal_mode
+    if not stdin_is_tty or saved_terminal_mode is not None:
+        return
+    fd = sys.stdin.fileno()
+    saved_terminal_mode = termios.tcgetattr(fd)
+    mode = termios.tcgetattr(fd)
+    mode[0] &= ~termios.IXON
+    mode[3] &= ~(termios.ICANON | termios.ECHO | termios.IEXTEN)
+    mode[6] = list(mode[6])
+    mode[6][termios.VMIN] = 1
+    mode[6][termios.VTIME] = 0
+    termios.tcsetattr(fd, termios.TCSANOW, mode)
+
+
+def restore_terminal() -> None:
+    """Put the terminal back the way it was found.
+
+    Registered with atexit as well as called from main, because leaving a
+    terminal in raw mode means no echo and no line editing in whatever the user
+    runs next, with `stty sane` typed blind as the only way out.
+    """
+    global saved_terminal_mode
+    if saved_terminal_mode is None:
+        return
+    try:
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, saved_terminal_mode)
+    except (OSError, ValueError, termios.error):
+        pass
+    saved_terminal_mode = None
+
+
+def echo(data: bytes) -> None:
+    """Show bytes the reader accepted, since the terminal no longer echoes."""
+    if not stdin_is_tty:
+        return
+    stream = getattr(sys.stderr, "buffer", None)
+    if stream is None:
+        return
+    stream.write(data)
+    stream.flush()
+
+
+def escape_end(buf: bytearray, start: int) -> int | None:
+    """Index just past the escape sequence at `start`, or None if incomplete.
+
+    Arrow keys and the like arrive as ESC [ ... final, and colour codes copied
+    out of a terminal look the same. None of it is text, so the whole sequence
+    is dropped. Returning None leaves the bytes buffered: a sequence split
+    across two reads must not be taken for a lone ESC.
+    """
+    size = len(buf)
+    if start + 1 >= size:
+        return None
+    if buf[start + 1] in (0x5b, 0x4f):          # CSI '[' or SS3 'O'
+        limit = min(size, start + 34)
+        for j in range(start + 2, limit):
+            if 0x40 <= buf[j] <= 0x7e:          # final byte
+                return j + 1
+        if limit == size:
+            return None                          # still incomplete
+        return start + 1                         # implausibly long; drop ESC
+    return start + 2
+
+
+def erase_char() -> None:
+    """Erase the last character of the line being composed."""
+    if not current_line:
+        return
+    text = current_line.decode("utf-8", "ignore")
+    current_line[:] = text[:-1].encode("utf-8")
+    echo(b"\b \b")
+
+
+def erase_to(size: int) -> None:
+    """Erase back to `size` characters, one character at a time."""
+    text = current_line.decode("utf-8", "ignore")
+    while len(text) > size:
+        text = text[:-1]
+        echo(b"\b \b")
+    current_line[:] = text.encode("utf-8")
+
+
+def erase_word() -> None:
+    """Erase the word before the cursor, the way Ctrl-W normally does."""
+    text = current_line.decode("utf-8", "ignore")
+    stripped = text.rstrip()
+    cut = stripped.rfind(" ")
+    erase_to(cut + 1 if cut >= 0 else 0)
+
+
+def consume_input() -> None:
+    """Turn buffered bytes into finished lines, leaving partial input alone.
+
+    Every byte that is not a key this reader implements is either text or
+    dropped. Nothing is interpreted twice and nothing is re-emitted, which is
+    the property the old line editor did not have.
+    """
+    global saw_eof
+    index = 0
+    while index < len(input_bytes):
+        byte = input_bytes[index]
+        if byte == 0x1b:
+            end = escape_end(input_bytes, index)
+            if end is None:
+                break
+            index = end
+            continue
+        if byte in (0x0a, 0x0d):                 # Enter, either flavour
+            ready_lines.append(current_line.decode("utf-8", "replace"))
+            current_line.clear()
+            echo(b"\r\n")
+            index += 1
+            continue
+        if byte in (0x7f, 0x08):
+            erase_char()
+            index += 1
+            continue
+        if byte == 0x15:                         # Ctrl-U
+            erase_to(0)
+            index += 1
+            continue
+        if byte == 0x17:                         # Ctrl-W
+            erase_word()
+            index += 1
+            continue
+        if byte == 0x04:                         # Ctrl-D
+            # Only ends input on an empty line. With text typed it is ignored
+            # rather than treated as a send, because losing typed text to a
+            # stray keystroke is worse than making the user press it twice.
+            if not current_line:
+                saw_eof = True
+            index += 1
+            continue
+        # Tab is text, not a key. It is the indentation of every pasted block
+        # of code, and the line editor this replaced treated it as "complete",
+        # which is exactly the kind of interpretation that has no place on a
+        # paste path.
+        if byte < 0x20 and byte != 0x09:
+            index += 1                           # some other control byte
+            continue
+        current_line.append(byte)
+        echo(bytes([byte]))
+        index += 1
+    del input_bytes[:index]
+
+
+def read_tty_line() -> str | None:
+    """One line from the terminal. None means Ctrl-D on an empty line.
+
+    A single read can deliver a whole pasted document, so finished lines are
+    buffered and handed out one at a time. That is what makes a paste cost one
+    read rather than one read per line.
+    """
+    global saw_eof
+    while True:
+        if ready_lines:
+            return ready_lines.popleft()
+        if saw_eof:
+            saw_eof = False
+            return None
+        # Here rather than in read_line: a pasted document is one read and
+        # many lines, and writing this per line put dozens of escape sequences
+        # on the terminal for a single paste.
+        disable_bracketed_paste()
+        try:
+            chunk = os.read(sys.stdin.fileno(), 65536)
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        input_bytes.extend(chunk)
+        consume_input()
+
+
 def ask(prompt: str) -> str | None:
     """Prompt on stderr and read a line. None means the input ended (Ctrl-D)."""
-    disable_bracketed_paste()
     sys.stderr.write(prompt)
     sys.stderr.flush()
-    try:
-        return input()
-    except EOFError:
-        return None
+    return read_line("")
 
 
 def read_line(prompt: str) -> str | None:
     """Read one line of a message. None means Ctrl-D.
 
-    The prompt is passed to input(), which writes it to stdout, so the caller
-    passes one only when stdout is a terminal: a redirected transcript holds
-    model text and nothing else.
+    The prompt goes to stderr, like everything else that is not model text, so
+    a redirected transcript holds what the model said and nothing else.
     """
-    disable_bracketed_paste()
-    try:
-        return input(prompt)
-    except EOFError:
-        return None
+    if not stdin_is_tty:
+        # Piped input: no terminal to configure and no keys to interpret.
+        raw = sys.stdin.readline()
+        return None if raw == "" else raw.rstrip("\n")
+    if prompt:
+        sys.stderr.write(prompt)
+        sys.stderr.flush()
+    return read_tty_line()
 
 
 def join_lines(lines: list[str]) -> str:
@@ -878,6 +1083,9 @@ async def main(resume: str | None) -> int:
     )
 
     prompts: asyncio.Queue[str | None] = asyncio.Queue()
+    # Before the reader thread starts, since it reads raw bytes from here on.
+    atexit.register(restore_terminal)
+    enter_raw_mode()
     client = ClaudeSDKClient(options=options)
     await client.connect()
     # Daemon, because it can be blocked in input() when the process ends and a
@@ -923,6 +1131,7 @@ async def main(resume: str | None) -> int:
     finally:
         stop_reader()
         abandon_approvals()
+        restore_terminal()
         await client.disconnect()
         if session_id:
             meta("good-claude: resume this conversation with: good-claude --resume %s" % session_id)
