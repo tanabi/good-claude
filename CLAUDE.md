@@ -178,6 +178,11 @@ There is no test suite. The client is exercised by hand:
   either readline backend, at any terminal speed. Do not conclude from a clean
   Linux run that a paste change is safe; the failing case was macOS, and the
   discriminating test was a plain read versus a line editor on that machine.
+  The raw reader was confirmed working on that macOS box over ssh, against the
+  same document that had been failing, so the approach is settled and only
+  regressions are in question. What is *not* settled is any future change to
+  the input path: it inherits a fix that cannot be regression-tested on Linux,
+  so it needs a paste on a real macOS terminal before it is believed.
 - To see whether anything is writing to the terminal behind the client's back,
   run it under a pty and grep the captured bytes for escape sequences. The only
   one that should appear is `ESC[?2004l`.
