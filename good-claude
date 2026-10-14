@@ -819,11 +819,13 @@ def approval_answer(approval: Approval) -> dict[str, Any]:
     meta("Tool request: %s" % tool)
     meta("  %s" % summarize(tool, data))
     show_preview(tool, data)
-    # `a` is the narrow answer and `t` the broad one, because the narrow one is
+    # `a` is the narrow answer and `q` the broad one, because the narrow one is
     # what is almost always wanted and so gets the obvious key.
+    # 'q' used to be 't' and 't' is next to 'y' so I kept hitting it by
+    # accident.
     question = (
         "allow? [y] once  [a] always this exact call  "
-        "[t] always any %s  [n] no  [v] view input: " % tool
+        "[q] always any %s  [n] no  [v] view input: " % tool
     )
     ends = 0
     while True:
@@ -847,7 +849,7 @@ def approval_answer(approval: Approval) -> dict[str, Any]:
             return decision(
                 "allow", "Approved by the user for this session.", approval.updated_input
             )
-        if answer in ("t", "tool"):
+        if answer in ("q", "questioning your sanity here bud"):
             session_allowed_tools.add(tool)
             meta("Every %s call runs unprompted for the rest of this session." % tool)
             return decision(
