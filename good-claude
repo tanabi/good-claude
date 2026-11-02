@@ -55,6 +55,15 @@ Tool approval:
     evaluate to "ask" -- anything covered by an allow rule in settings would
     otherwise run unannounced.
 
+Tool output:
+    A tool result is printed in full and never truncated, so reading a large
+    file prints the whole file. There is no ceiling on the size of a message
+    from the CLI either; the SDK's one-megabyte default is raised to nothing,
+    because an image attachment clears a megabyte by itself and the default
+    turns that into a fatal error mid-turn. An image is the one result not
+    printed as it arrived: its type and size are printed instead of its base64,
+    which would scroll the answer away and leave nothing worth pasting.
+
 Subagents:
     Agent calls are rewritten to run in the foreground, so a delegated result
     comes back inside the turn that asked for it. Backgrounding one only pays
@@ -142,6 +151,17 @@ COSMETIC_FIELDS = ("description",)
 DEFERRED_TASK_TYPES = frozenset({"local_agent", "local_workflow"})
 # DEC private mode 2004 off: deliver a paste as ordinary bytes.
 BRACKETED_PASTE_OFF = "\x1b[?2004l"
+# No ceiling on one NDJSON message from the CLI. The SDK defaults to 1 MiB and
+# turns anything larger into a fatal error that kills the session mid-turn, and
+# an image attachment clears that on its own: a 460 KiB screenshot is 615 KiB of
+# base64 before JSON escaping, and the frame carries it twice -- once in the
+# tool result, once in the user message the CLI echoes back. Nothing about this
+# client wants a limit below what the machine can hold, so there is none; an
+# oversized message now costs memory instead of the session. The SDK reuses this
+# number for the point at which it flushes an unterminated stderr line, so that
+# flush stops happening and a partial diagnostic waits for its newline or for
+# the stream to close, which is where cli_stderr already picks it up.
+MAX_MESSAGE_BYTES = sys.maxsize
 # Tools that delegate to a subagent. Named separately from the background shell
 # case, which must keep its own meaning of "background". See foreground_input.
 AGENT_TOOLS = ("Agent", "Task")
@@ -951,6 +971,19 @@ def input_loop(loop: asyncio.AbstractEventLoop, prompts: asyncio.Queue) -> None:
         lines.append(line)
 
 
+def image_summary(block: dict[str, Any]) -> str:
+    """Describe an image block without printing its payload."""
+    # Not a truncation of tool output: base64 is not text the user asked for,
+    # and a screenshot is hundreds of kilobytes of it. Printing that scrolls the
+    # answer away and makes the transcript useless to paste out of, which is the
+    # one thing this program is for.
+    source = block.get("source") or {}
+    media = str(source.get("media_type") or "image")
+    if source.get("type") == "base64":
+        return "[%s, %d bytes of base64]" % (media, len(str(source.get("data") or "")))
+    return "[%s, %s]" % (media, source.get("url") or source.get("type") or "unknown source")
+
+
 def result_text(content: str | list[dict[str, Any]] | None) -> str:
     """Flatten a tool result into text."""
     if content is None:
@@ -959,7 +992,13 @@ def result_text(content: str | list[dict[str, Any]] | None) -> str:
         return content
     parts = []
     for block in content:
-        parts.append(block.get("text", "") if block.get("type") == "text" else json.dumps(block))
+        kind = block.get("type")
+        if kind == "text":
+            parts.append(block.get("text", ""))
+        elif kind == "image":
+            parts.append(image_summary(block))
+        else:
+            parts.append(json.dumps(block))
     return "\n".join(parts)
 
 
@@ -1070,6 +1109,7 @@ async def main(resume: str | None) -> int:
         resume=resume,
         permission_mode="default",
         setting_sources=["user", "project", "local"],
+        max_buffer_size=MAX_MESSAGE_BYTES,
         # Registering this is what stops the subprocess inheriting the
         # terminal; see cli_stderr.
         stderr=cli_stderr,

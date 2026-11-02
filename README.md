@@ -107,6 +107,8 @@ Note that `a` is of little use on the writing tools. Two edits are the same call
 
 Once a tool runs, its output is printed under a `[tool result]` header, or `[tool error]` when the call failed. Both go to stderr along with everything else that is not model text. Results are printed in full and are not truncated, so reading a large file prints the whole file.
 
+The one thing not printed in full is an image. Reading a screenshot comes back as a few hundred kilobytes of base64, so the client prints its type and size, as in `[image/png, 629992 bytes of base64]`, instead of the payload. That is not a truncated result: base64 is not text you asked for, and printing it would scroll the answer away and leave a transcript that is useless to paste out of. There is no limit on the size of such a result, though. A message arriving from the CLI may be as large as memory allows, which is what makes reading a large image work at all.
+
 When the model delegates work to a subagent, the call is rewritten to run in the foreground, and the client says so:
 
 ```

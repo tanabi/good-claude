@@ -75,8 +75,18 @@ project.
    only fires when the CLI's permission rules already evaluate to "ask", so any
    tool covered by an allow rule in settings would run unannounced. Do not
    switch to `can_use_tool`.
-9. **Tool output is not truncated.** Reading a large file prints the whole
-   file. The user asked for the text.
+9. **Tool output is not truncated, and nothing caps the size of a message.**
+   Reading a large file prints the whole file. The user asked for the text. The
+   SDK's `max_buffer_size` is raised to `MAX_MESSAGE_BYTES`, because its 1 MiB
+   default is not a truncation but a fatal error that ends the session
+   mid-turn, and one image attachment clears it: a 460 KiB screenshot is
+   615 KiB of base64, carried twice in the frame. Do not put a limit back.
+   Printing an image's base64 is the opposite rule, not an exception to it:
+   `image_summary` prints the type and size because a screenshot's payload
+   would scroll the answer off the screen and leave a transcript with nothing
+   worth pasting in it. That reasoning is about base64 specifically. It does
+   not license summarizing, eliding, or counting lines of anything the user
+   would read.
 10. **A turn is not over while a delegated agent is still running.** `run_turn`
     reads past the first `ResultMessage` and returns only when a result arrives
     with nothing in flight, because a background agent outlives the turn that
@@ -199,6 +209,11 @@ There is no test suite. The client is exercised by hand:
 - Anything that leaves the process without running `restore_terminal` leaves
   the terminal without echo. If a test run ends with a dead-looking terminal,
   `stty sane` fixes it.
+- A large image is the regression test for the message size limit. Ask for a
+  `Read` of a screenshot of a few hundred kilobytes and approve it; the turn has
+  to finish with an `[image/png, N bytes of base64]` line where it used to die
+  with the SDK's "JSON message exceeded maximum buffer size" exception, and the
+  captured stderr has to stay small.
 - Check the stdout/stderr split on any change that prints:
   `./good-claude > out.txt 2> err.txt` and confirm `out.txt` holds only model
   text.
